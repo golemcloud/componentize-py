@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Biro <david.biro@ziverge.com>
+Date: Mon, 16 Nov 2026 21:48:30 +0000
+Subject: [PATCH] Bound deallocation chains by depth on WASI
+
+The trashcan defers a deallocation when the measured C stack margin is small,
+but on WebAssembly that margin measures only the linear-memory stack. A chain
+of list deallocations exhausts the engine's call stack long before. Count the
+nested deallocations instead.
+---
+ Objects/object.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/Objects/object.c b/Objects/object.c
+index b0bfaf0a5c..47aae62ab4 100644
+--- a/Objects/object.c
++++ b/Objects/object.c
+@@ -3067,6 +3067,17 @@ Py_ReprLeave(PyObject *obj)
+ 
+ /* Trashcan support. */
+ 
++#ifdef __wasi__
++/* On WebAssembly, C functions keep most of their state in the engine's own
++   call stack, which is separate from the linear-memory stack that
++   _Py_RecursionLimit_GetMargin() measures.  A chain of deallocations can
++   therefore exhaust the engine's stack while the measured margin still looks
++   large.  Deallocations nest strictly, so count them instead, and defer
++   deallocation once the chain is _PyWasi_DEALLOC_DEPTH deep. */
++#define _PyWasi_DEALLOC_DEPTH 50
++static int _PyWasi_dealloc_depth = 0;
++#endif
++
+ /* Add op to the gcstate->trash_delete_later list.  Called when the current
+  * call-stack depth gets large.  op must be a gc'ed object, with refcount 0.
+  *  Py_DECREF must already have been called on it.
+@@ -3125,7 +3136,15 @@ _PyTrash_thread_destroy_chain(PyThreadState *tstate)
+         _Py_ForgetReference(op);
+ #endif
+         _PyReftracerTrack(op, PyRefTracer_DESTROY);
++#ifdef __wasi__
++        /* Count this call too, so that a deallocation it starts cannot
++           unwind the chain again at the same depth. */
++        _PyWasi_dealloc_depth++;
++#endif
+         (*dealloc)(op);
++#ifdef __wasi__
++        _PyWasi_dealloc_depth--;
++#endif
+     }
+ }
+ 
+@@ -3195,6 +3214,15 @@ _Py_Dealloc(PyObject *op)
+     destructor dealloc = type->tp_dealloc;
+     PyThreadState *tstate = _PyThreadState_GET();
+     intptr_t margin = _Py_RecursionLimit_GetMargin(tstate);
++#ifdef __wasi__
++    if (_PyWasi_dealloc_depth >= _PyWasi_DEALLOC_DEPTH) {
++        margin = 0;
++    }
++    else if (_PyWasi_dealloc_depth >= _PyWasi_DEALLOC_DEPTH / 2 && margin >= 4) {
++        /* Too deep to unwind the deferred chain here. */
++        margin = 3;
++    }
++#endif
+     if (margin < 2 && gc_flag) {
+         _PyTrash_thread_deposit_object(tstate, (PyObject *)op);
+         return;
+@@ -3217,7 +3245,13 @@ _Py_Dealloc(PyObject *op)
+     _Py_ForgetReference(op);
+ #endif
+     _PyReftracerTrack(op, PyRefTracer_DESTROY);
++#ifdef __wasi__
++    _PyWasi_dealloc_depth++;
++#endif
+     (*dealloc)(op);
++#ifdef __wasi__
++    _PyWasi_dealloc_depth--;
++#endif
+ 
+ #ifdef Py_DEBUG
+     // gh-89373: The tp_dealloc function must leave the current exception

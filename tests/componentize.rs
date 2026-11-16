@@ -450,3 +450,159 @@ fn install_numpy(path: &Path) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+fn prepare_cli_world(dir: &Path, output: &str) -> anyhow::Result<String> {
+    if !dir.join("wit").exists() {
+        fs_extra::copy_items(&["./wit"], dir, &CopyOptions::new())?;
+    }
+    let assert = cargo::cargo_bin_cmd!("componentize-py")
+        .current_dir(dir)
+        .args([
+            "-d",
+            "wit",
+            "-w",
+            "wasi:cli/command@0.2.0",
+            "prepare",
+            output,
+        ])
+        .assert()
+        .success();
+    Ok(String::from_utf8(assert.get_output().stdout.clone())?
+        .trim()
+        .to_owned())
+}
+
+fn write_cli_app(dir: &Path, module: &str, prelude: &str, text: &str) -> anyhow::Result<PathBuf> {
+    let app = dir.join(module);
+    fs::create_dir_all(&app)?;
+    fs::write(
+        app.join(format!("{module}.py")),
+        format!(
+            "{prelude}from wit.exports.wasi.cli_v0_2 import run, Run\n\n\
+             @run.guest\nclass Cli(Run):\n    def run(self) -> None:\n        print({text:?})\n"
+        ),
+    )?;
+    Ok(app)
+}
+
+fn assemble_cmd(dir: &Path, module: &str, app: &Path, extra: &[&str]) -> Command {
+    let mut command = cargo::cargo_bin_cmd!("componentize-py");
+    command
+        .current_dir(dir)
+        .args(["assemble", "--prepared", "prepared"])
+        .args(extra)
+        .args([module, "-p"])
+        .arg(format!("app={}", app.display()))
+        .args(["-o", &format!("{module}.wasm")]);
+    command
+}
+
+fn tree(dir: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(tree(&path)?);
+        } else {
+            files.push((path.clone(), fs::read(&path)?));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[test]
+fn prepared_assets_assemble_unrelated_apps() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let identity = prepare_cli_world(dir.path(), "prepared")?;
+    assert_eq!(
+        prepare_cli_world(dir.path(), "prepared-again")?,
+        identity,
+        "preparing the same WIT twice gives the same identity"
+    );
+    let before = tree(&dir.path().join("prepared"))?;
+
+    for (module, text) in [("first", "first app"), ("second", "the second app")] {
+        let app = write_cli_app(dir.path(), module, "", text)?;
+        assemble_cmd(dir.path(), module, &app, &["--expect-identity", &identity])
+            .assert()
+            .success();
+
+        Command::new("wasmtime")
+            .current_dir(dir.path())
+            .args(["run", &format!("{module}.wasm")])
+            .assert()
+            .success()
+            .stdout(format!("{text}\n"));
+    }
+
+    assert!(
+        before == tree(&dir.path().join("prepared"))?,
+        "assembly does not change the prepared assets"
+    );
+    Ok(())
+}
+
+#[test]
+fn assemble_rejects_mismatched_assets_before_imports() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    prepare_cli_world(dir.path(), "prepared")?;
+    // Importing the app writes a marker into its own directory.
+    let app = write_cli_app(
+        dir.path(),
+        "marker",
+        "open('/app/imported', 'w').close()\n",
+        "ok",
+    )?;
+    let marker = app.join("imported");
+
+    assemble_cmd(dir.path(), "marker", &app, &[])
+        .assert()
+        .success();
+    assert!(marker.exists(), "intact assets import the app");
+    fs::remove_file(&marker)?;
+
+    let blob = fs::read_dir(dir.path().join("prepared/blobs"))?
+        .next()
+        .unwrap()?
+        .path();
+    let original = fs::read(&blob)?;
+    let mut changed = original.clone();
+    changed[0] ^= 1;
+    fs::write(&blob, &changed)?;
+    assemble_cmd(dir.path(), "marker", &app, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not match its digest"));
+    fs::write(&blob, &original)?;
+
+    fs::write(dir.path().join("prepared/extra"), "")?;
+    assemble_cmd(dir.path(), "marker", &app, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected entry `extra`"));
+    fs::remove_file(dir.path().join("prepared/extra"))?;
+
+    assemble_cmd(dir.path(), "marker", &app, &["--expect-identity", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not 0"));
+
+    assert!(!marker.exists(), "rejected assets do not import the app");
+    Ok(())
+}
+
+#[test]
+fn assemble_rejects_apps_that_configure_wit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    prepare_cli_world(dir.path(), "prepared")?;
+    let app = write_cli_app(dir.path(), "configured", "", "ok")?;
+    fs::create_dir(app.join("sdk"))?;
+    fs::write(app.join("sdk/componentize-py.toml"), "")?;
+
+    assemble_cmd(dir.path(), "configured", &app, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("configures WIT bindings"));
+    Ok(())
+}

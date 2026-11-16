@@ -437,3 +437,52 @@ fn module_name(root: &Path, path: &Path) -> Option<String> {
         None
     }
 }
+
+/// Finds the native extensions and support libraries in an application's
+/// Python path, for assembly with prepared bindings.
+///
+/// Each entry is mounted at `/{name}`, so the library name of an extension is
+/// `/{name}/{path relative to the entry}`.  The names, and the order of the
+/// returned libraries, do not depend on the order of the entries.  A
+/// `componentize-py.toml` file is an error, because it changes the WIT
+/// bindings, which prepared bindings fix.
+pub fn application_libraries(
+    python_path: &[(&str, &Path)],
+) -> Result<(Vec<Library>, Vec<PathBuf>)> {
+    let mut libraries = Vec::new();
+    let mut support = Vec::new();
+    for &(name, root) in python_path {
+        let mut found = Vec::new();
+        let mut configs = Vec::new();
+        search_directory(
+            root,
+            root,
+            &mut found,
+            &mut support,
+            &mut configs,
+            &mut HashSet::new(),
+        )?;
+        if let Some(config) = configs.first() {
+            bail!(
+                "{} configures WIT bindings, but prepared bindings cannot change; \
+                 prepare bindings that include this WIT instead",
+                config.path.join("componentize-py.toml").display()
+            );
+        }
+        for library in found {
+            let path = library
+                .strip_prefix(root)?
+                .to_str()
+                .context("non-UTF-8 path")?
+                .replace('\\', "/");
+            libraries.push(Library {
+                name: format!("/{name}/{path}"),
+                module: fs::read(&library).with_context(|| library.display().to_string())?,
+                dl_openable: true,
+            });
+        }
+    }
+    libraries.sort_by(|a, b| a.name.cmp(&b.name));
+    support.sort();
+    Ok((libraries, support))
+}

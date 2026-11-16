@@ -41,6 +41,7 @@ use {
 pub mod command;
 mod link;
 mod prelink;
+pub mod prepared;
 #[cfg(feature = "pyo3")]
 mod python;
 mod registry;
@@ -59,6 +60,7 @@ wasmtime::component::bindgen!({
     path: "wit",
     world: "init",
     exports: { default: async },
+    additional_derives: [serde::Serialize, serde::Deserialize],
 });
 
 pub use {component_init_transform::Invoker, exports::exports::Symbols};

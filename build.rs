@@ -2,6 +2,7 @@
 
 use {
     anyhow::{Context, Result, anyhow, bail},
+    sha2::{Digest as _, Sha256},
     std::{
         env,
         fmt::Write as _,
@@ -22,9 +23,14 @@ const STRIP_RUNTIME: bool = !DEBUG_RUNTIME;
 const ZSTD_COMPRESSION_LEVEL: i32 = if DEBUG_RUNTIME { 0 } else { 19 };
 const DEFAULT_SDK_VERSION: &str = "34";
 
-// SQLite version to build - 3.51.2 (latest as of Jan 2026)
-const SQLITE_VERSION: &str = "3510200";
+const SQLITE_VERSION: &str = "3540100";
 const SQLITE_YEAR: &str = "2026";
+const SQLITE_TARBALL_SHA256: &str =
+    "926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e";
+
+const ZLIB_VERSION: &str = "1.3.2";
+const ZLIB_TARBALL_SHA256: &str =
+    "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16";
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const PYTHON_EXECUTABLE: &str = "python.exe";
@@ -36,10 +42,11 @@ const CLANG_EXECUTABLE: &str = "clang.exe";
 #[cfg(not(target_os = "windows"))]
 const CLANG_EXECUTABLE: &str = "clang";
 
-// TODO: switch to upstream release per
-// https://github.com/bytecodealliance/componentize-py/issues/215
-const CPYTHON_TARBALL_URL: &str = "https://github.com/dicej/cpython/tarball/v3.14.0-wasi-sdk-30";
-const CPYTHON_TARBALL_BASE_DIR: &str = "dicej-cpython-0e13686";
+// The CPython release tarball from python.org, plus the WASI patches in
+// `cpython-patches/` that are not part of this release.
+const CPYTHON_VERSION: &str = "3.14.10";
+const CPYTHON_TARBALL_SHA256: &str =
+    "9e4996c19ae5a3df31f10c37723661f71d3455d73bd005f79df7098e5cc13192";
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -154,7 +161,8 @@ fn find_wasi_sdk(out_dir: &Path) -> Result<PathBuf> {
         url,
         wasi_sdk.display()
     );
-    fetch_extract(&url, out_dir)?;
+    // The SDK source and version are configurable, so no digest is pinned for it.
+    fetch_extract(&url, None, out_dir)?;
 
     Ok(wasi_sdk)
 }
@@ -307,13 +315,31 @@ fn add(builder: &mut Builder<impl Write>, root: &Path, path: &Path) -> Result<()
 
 fn maybe_make_cpython(repo_dir: &Path, wasi_sdk: &Path) -> Result<()> {
     let cpython_dir = repo_dir.join("cpython");
+    let patch_dir = repo_dir.join("cpython-patches");
+    println!("cargo:rerun-if-changed={}", patch_dir.display());
     if !cpython_dir.exists() {
-        let url = &env::var("CPYTHON_TARBALL_URL").unwrap_or_else(|_| CPYTHON_TARBALL_URL.into());
-        let base_dir = &env::var_os("CPYTHON_TARBALL_BASE_DIR")
-            .unwrap_or_else(|| CPYTHON_TARBALL_BASE_DIR.into());
+        let url = format!(
+            "https://www.python.org/ftp/python/{CPYTHON_VERSION}/Python-{CPYTHON_VERSION}.tgz"
+        );
         println!("cargo:warning=downloading CPython source code from {url}");
-        fetch_extract(url, repo_dir)?;
-        fs::rename(repo_dir.join(base_dir), &cpython_dir)?;
+        fetch_extract(&url, Some(CPYTHON_TARBALL_SHA256), repo_dir)?;
+        let source_dir = repo_dir.join(format!("Python-{CPYTHON_VERSION}"));
+
+        let mut patches = fs::read_dir(&patch_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        patches.sort();
+        for patch in patches {
+            run(Command::new("patch")
+                .current_dir(&source_dir)
+                .arg("--batch")
+                .arg("--forward")
+                .arg("-p1")
+                .arg("-i")
+                .arg(&patch))?;
+        }
+
+        fs::rename(source_dir, &cpython_dir)?;
     }
 
     let cpython_wasi_dir = cpython_dir.join("builddir/wasi");
@@ -575,9 +601,15 @@ fn make_runtime(
     Ok(())
 }
 
-fn fetch_extract(url: &str, out_dir: &Path) -> Result<()> {
-    let response = reqwest::blocking::get(url)?;
-    let decoder = flate2::read::GzDecoder::new(response);
+fn fetch_extract(url: &str, sha256: Option<&str>, out_dir: &Path) -> Result<()> {
+    let bytes = reqwest::blocking::get(url)?.error_for_status()?.bytes()?;
+    if let Some(expected) = sha256 {
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != expected {
+            bail!("{url} has SHA-256 {actual}, expected {expected}");
+        }
+    }
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(out_dir)?;
     Ok(())
@@ -603,10 +635,13 @@ fn add_compile_envs(wasi_sdk: &Path, command: &mut Command) {
 fn build_zlib(wasi_sdk: &Path, install_dir: &Path) -> Result<()> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     fetch_extract(
-        "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+        &format!(
+            "https://github.com/madler/zlib/releases/download/v{ZLIB_VERSION}/zlib-{ZLIB_VERSION}.tar.gz"
+        ),
+        Some(ZLIB_TARBALL_SHA256),
         &out_dir,
     )?;
-    let src_dir = out_dir.join("zlib-1.3.1");
+    let src_dir = out_dir.join(format!("zlib-{ZLIB_VERSION}"));
 
     let prefix = install_dir
         .to_str()
@@ -663,7 +698,7 @@ fn build_sqlite(wasi_sdk: &Path, install_dir: &Path) -> Result<()> {
 
     // Download SQLite amalgamation
     let url = format!("https://sqlite.org/{SQLITE_YEAR}/sqlite-autoconf-{SQLITE_VERSION}.tar.gz");
-    fetch_extract(&url, &out_dir)?;
+    fetch_extract(&url, Some(SQLITE_TARBALL_SHA256), &out_dir)?;
 
     let src_dir = out_dir.join(format!("sqlite-autoconf-{SQLITE_VERSION}"));
 

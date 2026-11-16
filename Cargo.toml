@@ -82,6 +82,8 @@ tar = "0.4.41"
 zstd = "0.13.2"
 componentize-py-test-generator = { path = "test-generator", version = "0.25.0" }
 flate2 = "1.1.1"
+hex = "0.4.3"
+sha2 = "0.10.9"
 wasmparser = "0.258.0"
 wasm-encoder = "0.258.0"
 

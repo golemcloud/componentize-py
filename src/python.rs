@@ -18,7 +18,7 @@ use {
 #[allow(clippy::too_many_arguments)]
 #[pyo3::pyfunction]
 #[pyo3(name = "componentize")]
-#[pyo3(signature = (wit_path, worlds, features, all_features, bindings_module, python_path, module_worlds, app_name, output_path, stub_wasi, import_interface_names, export_interface_names, full_names = None, intersect_world = None, world_module = None, registry_config = None, no_default_registries = false))]
+#[pyo3(signature = (wit_path, worlds, features, all_features, bindings_module, python_path, module_worlds, app_name, output_path, stub_wasi, import_interface_names, export_interface_names, full_names = None, intersect_world = None, world_module = None, registry_config = None, no_default_registries = false, stack_size = None))]
 fn python_componentize(
     wit_path: Vec<PathBuf>,
     worlds: Vec<String>,
@@ -37,6 +37,7 @@ fn python_componentize(
     world_module: Option<&str>,
     registry_config: Option<PathBuf>,
     no_default_registries: bool,
+    stack_size: Option<u32>,
 ) -> PyResult<()> {
     let bindings_module = crate::resolve_deprecated(
         bindings_module.map(str::to_owned),
@@ -65,6 +66,7 @@ fn python_componentize(
                 output_path: &output_path,
                 add_to_linker: None,
                 stub_wasi,
+                stack_size,
                 import_interface_names: &import_interface_names
                     .iter()
                     .map(|(a, b)| (a.as_ref(), b.as_ref()))

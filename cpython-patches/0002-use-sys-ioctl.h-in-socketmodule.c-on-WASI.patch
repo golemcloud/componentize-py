@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joel Dice <joel.dice@akamai.com>
+Date: Thu, 12 Feb 2026 10:21:16 -0700
+Subject: [PATCH 2/2] use `sys/ioctl.h` in `socketmodule.c` on WASI
+
+As of this writing, `wasi-libc` does not yet support `O_NONBLOCK` in its `fcntl`
+implementation, but _does_ support `FIONBIO` in its `ioctl` implementation, so
+we need to use the latter.
+---
+ Modules/socketmodule.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Modules/socketmodule.c b/Modules/socketmodule.c
+index b9dadaf6a8..4997518ac2 100644
+--- a/Modules/socketmodule.c
++++ b/Modules/socketmodule.c
+@@ -203,7 +203,7 @@ shutdown(how) -- shut down traffic in one or both directions\n\
+ # define USE_GETHOSTBYNAME_LOCK
+ #endif
+ 
+-#if defined(__APPLE__) || defined(__CYGWIN__) || defined(__NetBSD__)
++#if defined(__APPLE__) || defined(__CYGWIN__) || defined(__NetBSD__) || defined(__wasi__)
+ #  include <sys/ioctl.h>
+ #endif
+ 

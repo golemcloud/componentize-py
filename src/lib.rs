@@ -8,6 +8,7 @@ use {
     futures::future::FutureExt,
     indexmap::{IndexMap, IndexSet},
     serde::Deserialize,
+    sha2::{Digest as _, Sha256},
     std::{
         borrow::Cow,
         collections::{HashMap, HashSet},
@@ -26,7 +27,7 @@ use {
         component::{Component, Instance, Linker, ResourceTable, ResourceType},
     },
     wasmtime_wasi::{
-        FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+        Deterministic, FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
         p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     },
     wit_component::metadata,
@@ -73,6 +74,52 @@ impl WasiView for Ctx {
             table: &mut self.table,
         }
     }
+}
+
+/// The clock seen during pre-initialization.  It starts at the Unix epoch and
+/// advances one microsecond each time it is read, so nothing the application
+/// saves depends on when it was built, and code waiting for time to pass still
+/// finishes.
+#[derive(Default)]
+struct BuildClock(std::sync::atomic::AtomicU64);
+
+impl BuildClock {
+    fn tick(&self) -> u64 {
+        self.0.fetch_add(1000, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl wasmtime_wasi::HostWallClock for BuildClock {
+    fn resolution(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(1)
+    }
+
+    fn now(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.tick())
+    }
+}
+
+impl wasmtime_wasi::HostMonotonicClock for BuildClock {
+    fn resolution(&self) -> u64 {
+        1000
+    }
+
+    fn now(&self) -> u64 {
+        self.tick()
+    }
+}
+
+/// Sets the access and modification times of `path` and everything under it
+/// to the Unix epoch.
+fn set_build_mtimes(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            set_build_mtimes(&entry?.path())?;
+        }
+    }
+    // `FileTime::zero` is the platform epoch, which Windows cannot set.
+    let epoch = filetime::FileTime::from_unix_time(0, 0);
+    filetime::set_file_times(path, epoch, epoch).with_context(|| path.display().to_string())
 }
 
 pub struct Library {
@@ -410,6 +457,9 @@ pub struct ComponentGenerator<'a> {
     pub output_path: &'a Path,
     pub add_to_linker: AddToLinker<'a>,
     pub stub_wasi: bool,
+    /// Size in bytes of the linear-memory stack shared by C code, which
+    /// CPython's recursion guard measures.  `None` keeps the linker default.
+    pub stack_size: Option<u32>,
     pub import_interface_names: &'a HashMap<&'a str, &'a str>,
     pub export_interface_names: &'a HashMap<&'a str, &'a str>,
     pub intersect_world: Option<&'a str>,
@@ -816,7 +866,7 @@ impl ComponentGenerator<'_> {
             dl_openable: false,
         });
 
-        let component = link::link_libraries(&libraries)?;
+        let component = link::link_libraries(&libraries, self.stack_size)?;
 
         let stubbed_component = if self.stub_wasi {
             stubwasi::link_stub_modules(libraries)?
@@ -833,7 +883,34 @@ impl ComponentGenerator<'_> {
         let stdout = MemoryOutputPipe::new(10000);
         let stderr = MemoryOutputPipe::new(10000);
 
+        // Pre-initialization saves everything the application computes into
+        // the component, so derive its hash seed and random bytes from the
+        // linked component instead of from host entropy.  Identical inputs then
+        // produce identical components.  The runtime reseeds `random` from the
+        // host before the first export call.
+        let digest = Sha256::digest(&component);
+        let random_bytes = (0u32..1024)
+            .flat_map(|counter| {
+                Sha256::new()
+                    .chain_update(digest)
+                    .chain_update(counter.to_le_bytes())
+                    .finalize()
+            })
+            .collect::<Vec<_>>();
+
         let mut wasi = WasiCtxBuilder::new();
+        wasi.secure_random(Deterministic::new(random_bytes.clone()))
+            .insecure_random(Deterministic::new(random_bytes))
+            .insecure_random_seed(u128::from_le_bytes(digest[..16].try_into().unwrap()))
+            .env(
+                "PYTHONHASHSEED",
+                u32::from_le_bytes(digest[..4].try_into().unwrap()).to_string(),
+            )
+            .wall_clock(BuildClock::default())
+            .monotonic_clock(BuildClock::default())
+            // Writing bytecode would change the source directories during the
+            // build and record the time of the write.
+            .env("PYTHONDONTWRITEBYTECODE", "1");
         wasi.stdin(MemoryInputPipe::new(Bytes::new()))
             .stdout(stdout.clone())
             .stderr(stderr.clone())
@@ -932,6 +1009,18 @@ impl ComponentGenerator<'_> {
                 }
                 wasi.preopened_dir(world_dir.path(), mount, FsPerms::ReadWrite)?;
             }
+        }
+
+        // The guest's import system records directory modification times, so
+        // give the directories created for this build a fixed time.
+        for dir in [
+            embedded_python_standard_lib.path(),
+            embedded_helper_utils.path(),
+        ]
+        .into_iter()
+        .chain(world_dir_mounts.iter().map(|(_, dir)| dir.path()))
+        {
+            set_build_mtimes(dir)?;
         }
 
         if DEBUG_PYTHON_BINDINGS {

@@ -82,6 +82,7 @@ async fn make_component(
         output_path: &tempdir.path().join("app.wasm"),
         add_to_linker,
         stub_wasi: false,
+        stack_size: None,
         import_interface_names: &HashMap::new(),
         export_interface_names: &HashMap::new(),
         intersect_world,

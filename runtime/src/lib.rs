@@ -1398,11 +1398,22 @@ impl Interpreter for MyInterpreter {
         }
     }
 
-    fn resource_dtor(ty: wit::Resource, handle: usize) {
-        // We don't currently include a `drop` function as part of the abstract
-        // base class we generate for an exported resource, so there's nothing
-        // to do here.  If/when that changes, we'll want to call `drop` here.
-        _ = (ty, handle);
+    fn resource_dtor(_ty: wit::Resource, handle: usize) {
+        // `exported_resource_to_canon` gave the handle table a strong reference
+        // to the Python object as its rep. The last handle is gone, so release
+        // that reference; the object is finalized once nothing else uses it.
+        Python::attach(|py| {
+            let value = unsafe { Bound::<PyAny>::from_owned_ptr(py, handle as _) };
+            let name = intern!(py, "__componentize_py_handle");
+            if value.hasattr(name).unwrap() {
+                value.delattr(name).unwrap();
+            }
+            value
+                .getattr(intern!(py, "finalizer"))
+                .unwrap()
+                .call_method0(intern!(py, "detach"))
+                .unwrap();
+        })
     }
 }
 
@@ -1994,20 +2005,12 @@ impl Call for MyCall<'_> {
     fn push_own(&mut self, ty: wit::Resource, handle: u32) {
         Python::attach(|py| {
             self.stack.push(if let Some(rep) = ty.rep() {
-                // exported resource type
+                // exported resource type: take the object back and drop the
+                // handle, whose destructor releases the handle table's
+                // reference to it.
                 let rep = unsafe { rep(handle) };
                 let value = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, rep as _) };
-
-                value
-                    .delattr(intern!(py, "__componentize_py_handle"))
-                    .unwrap();
-
-                value
-                    .getattr(intern!(py, "finalizer"))
-                    .unwrap()
-                    .call_method0(intern!(py, "detach"))
-                    .unwrap();
-
+                unsafe { ty.drop()(handle) };
                 value.unbind()
             } else {
                 // imported resource type

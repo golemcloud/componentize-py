@@ -83,6 +83,7 @@ fn stubs_for_clippy(out_dir: &Path) -> Result<()> {
         "libwasi-emulated-signal.so.zst",
         "libc++.so.zst",
         "libc++abi.so.zst",
+        "libsetjmp.so.zst",
         "wasi_snapshot_preview1.reactor.wasm.zst",
     ];
 
@@ -197,6 +198,7 @@ fn package_all_the_things(out_dir: &Path) -> Result<()> {
 
     let libraries = [
         "libc.so",
+        "libsetjmp.so",
         "libwasi-emulated-mman.so",
         "libwasi-emulated-process-clocks.so",
         "libwasi-emulated-getpid.so",

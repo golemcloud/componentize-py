@@ -57,7 +57,97 @@ pub fn embedded_helper_utils() -> Result<TempDir> {
     Ok(bundled)
 }
 
-pub fn bundle_libraries(library_path: Vec<(&str, Vec<PathBuf>)>) -> Result<Vec<Library>> {
+/// Support libraries from the WASI SDK that extensions may depend on.  Each is
+/// linked only when a linked library names it in its `dylink.0` needed list.
+fn toolchain_support_libraries() -> Result<Vec<(&'static str, Vec<u8>)>> {
+    Ok(vec![(
+        "libsetjmp.so",
+        zstd::decode_all(Cursor::new(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/libsetjmp.so.zst"
+        ))))?,
+    )])
+}
+
+/// Returns the names in a module's `dylink.0` needed list.
+fn needed_libraries(module: &[u8]) -> Result<Vec<String>> {
+    let mut needed = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(module) {
+        if let wasmparser::Payload::CustomSection(section) = payload?
+            && let wasmparser::KnownCustom::Dylink0(reader) = section.as_known()
+        {
+            for subsection in reader {
+                if let wasmparser::Dylink0Subsection::Needed(names) = subsection? {
+                    needed.extend(names.into_iter().map(String::from));
+                }
+            }
+        }
+    }
+    Ok(needed)
+}
+
+/// Adds every support library that a linked library needs, directly or
+/// through another support library.
+///
+/// A support library is a shared library that is not a Python extension, such
+/// as `libjpeg.so` shipped next to the extension using it.  It is linked under
+/// its file name, which is the name its dependents use, and is not visible to
+/// `dlopen`.  Support libraries that nothing needs are not linked, so they do
+/// not change the component.  A needed name that remains unresolved is reported
+/// by the linker as a missing library.
+fn add_support_libraries(libraries: &mut Vec<Library>, support: &[PathBuf]) -> Result<()> {
+    let mut candidates: IndexMap<String, Vec<(String, Vec<u8>)>> = IndexMap::new();
+    for path in support {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("non-UTF-8 path")?
+            .to_owned();
+        let module = fs::read(path).with_context(|| path.display().to_string())?;
+        candidates
+            .entry(name)
+            .or_default()
+            .push((path.display().to_string(), module));
+    }
+    let toolchain = toolchain_support_libraries()?;
+
+    let mut index = 0;
+    while index < libraries.len() {
+        for needed in needed_libraries(&libraries[index].module)? {
+            if libraries.iter().any(|library| library.name == needed) {
+                continue;
+            }
+            let module = if let Some(found) = candidates.get(&needed) {
+                let (first_path, first) = &found[0];
+                if let Some((other_path, _)) = found.iter().find(|(_, module)| module != first) {
+                    bail!(
+                        "support library `{needed}` needed by `{}` has different contents at \
+                         {first_path} and {other_path}",
+                        libraries[index].name
+                    );
+                }
+                first.clone()
+            } else if let Some((_, module)) = toolchain.iter().find(|(name, _)| *name == needed) {
+                module.clone()
+            } else {
+                continue;
+            };
+            libraries.push(Library {
+                name: needed,
+                module,
+                dl_openable: false,
+            });
+        }
+        index += 1;
+    }
+
+    Ok(())
+}
+
+pub fn bundle_libraries(
+    library_path: Vec<(&str, Vec<PathBuf>)>,
+    support: &[PathBuf],
+) -> Result<Vec<Library>> {
     let mut libraries = vec![
         Library {
             name: "libcomponentize_py_runtime_sync.so".into(),
@@ -159,6 +249,8 @@ pub fn bundle_libraries(library_path: Vec<(&str, Vec<PathBuf>)>) -> Result<Vec<L
         }
     }
 
+    add_support_libraries(&mut libraries, support)?;
+
     Ok(libraries)
 }
 
@@ -169,19 +261,21 @@ pub fn search_for_libraries_and_configs<'a>(
 ) -> Result<(ConfigsMatchedWorlds<'a>, Vec<Library>)> {
     let mut raw_configs: Vec<ConfigContext<RawComponentizePyConfig>> = Vec::new();
     let mut library_path: Vec<(&str, Vec<PathBuf>)> = Vec::with_capacity(python_path.len());
+    let mut support = Vec::new();
     for path in python_path {
         let mut libraries = Vec::new();
         search_directory(
             Path::new(path),
             Path::new(path),
             &mut libraries,
+            &mut support,
             &mut raw_configs,
             &mut HashSet::new(),
         )?;
         library_path.push((*path, libraries));
     }
 
-    let libraries = bundle_libraries(library_path)?;
+    let libraries = bundle_libraries(library_path, &support)?;
 
     // Validate the paths parsed from any componentize-py.toml files discovered
     // above and match them up with `module_worlds` entries.  Note that we use
@@ -234,12 +328,20 @@ fn search_directory(
     root: &Path,
     path: &Path,
     libraries: &mut Vec<PathBuf>,
+    support: &mut Vec<PathBuf>,
     configs: &mut Vec<ConfigContext<RawComponentizePyConfig>>,
     modules_seen: &mut HashSet<String>,
 ) -> Result<()> {
     if path.is_dir() {
         for entry in fs::read_dir(path).with_context(|| path.display().to_string())? {
-            search_directory(root, &entry?.path(), libraries, configs, modules_seen)?;
+            search_directory(
+                root,
+                &entry?.path(),
+                libraries,
+                support,
+                configs,
+                modules_seen,
+            )?;
         }
     } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
         if NATIVE_EXTENSION_SUFFIXES
@@ -248,6 +350,8 @@ fn search_directory(
             && is_wasm_file(path)
         {
             libraries.push(path.to_owned());
+        } else if name.ends_with(".so") && is_wasm_file(path) {
+            support.push(path.to_owned());
         } else if name == "componentize-py.toml" {
             let root = root
                 .canonicalize()

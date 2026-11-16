@@ -6,15 +6,18 @@
 //! initialization needs.  [`Prepared::write`] persists them to a directory and
 //! [`Prepared::read`] loads and verifies them in another process.
 //! [`Assembler`] then links the prepared assets with an application and its
-//! native extensions, without WIT processing or code generation.
+//! native extensions, without WIT processing or code generation, and
+//! [`Assembly::initialize`] pre-initializes the result on the caller's engine.
+//!
+//! Reading and assembling prepared assets does not need the `embedded-runtime`
+//! feature; preparing them does.
 
 use {
     crate::{
-        AddToLinker, ComponentGenerator, ImportStub, InitPlan, Invoker, Library, Preopen, Symbols,
+        ComponentGenerator, ImportStub, InitPlan, Initializer, Library, Preopen, Symbols,
         initialize, link, prelink, set_build_mtimes,
     },
     anyhow::{Context, Result, bail, ensure},
-    futures::future::BoxFuture,
     serde::{Deserialize, Serialize},
     sha2::{Digest as _, Sha256},
     std::{
@@ -447,17 +450,9 @@ impl Assembler<'_> {
 }
 
 impl Assembly {
-    /// Pre-initializes the component with this crate's own Wasmtime engine.
-    pub async fn initialize(&self, add_to_linker: AddToLinker<'_>) -> Result<Vec<u8>> {
-        initialize(&self.component, None, &self.plan, add_to_linker).await
-    }
-
-    /// Pre-initializes the component with a caller-supplied initializer, which
-    /// receives the instrumented component and must follow [`Assembly::plan`].
-    pub async fn initialize_with(
-        &self,
-        initializer: impl FnOnce(Vec<u8>) -> BoxFuture<'static, Result<Box<dyn Invoker>>>,
-    ) -> Result<Vec<u8>> {
-        component_init_transform::initialize_staged(&self.component, None, initializer).await
+    /// Pre-initializes the component on the initializer's engine and returns
+    /// the initialized component.
+    pub async fn initialize(&self, initializer: Initializer<'_>) -> Result<Vec<u8>> {
+        initialize(&self.component, None, &self.plan, initializer).await
     }
 }

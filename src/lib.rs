@@ -449,6 +449,9 @@ fn resolve_helper_placeholders(path: &Path, replacements: &[(&str, String)]) -> 
 
 pub type AddToLinker<'a> = Option<&'a dyn Fn(&mut Linker<Ctx>) -> Result<()>>;
 
+/// Prepares the store of pre-initialization; see [`Initializer::configure_store`].
+pub type ConfigureStore<'a> = Option<&'a dyn Fn(&mut Store<Ctx>) -> Result<()>>;
+
 pub struct ComponentGenerator<'a> {
     pub wit_paths: &'a [&'a Path],
     pub worlds: &'a [&'a str],
@@ -518,13 +521,18 @@ impl ComponentGenerator<'_> {
             &component,
         );
 
+        let engine = default_engine()?;
         let component = initialize(
             &component,
             stubbed_component
                 .as_ref()
                 .map(|(component, map)| (component.deref(), map as &dyn Fn(u32) -> u32)),
             &plan,
-            self.add_to_linker,
+            Initializer {
+                engine: &engine,
+                add_to_linker: self.add_to_linker,
+                configure_store: None,
+            },
         )
         .await?;
 
@@ -545,6 +553,12 @@ impl ComponentGenerator<'_> {
     /// Resolves the WIT inputs, generates the Wasm and Python bindings, and
     /// collects the libraries to link, without linking or initializing.
     async fn bind(&self) -> Result<Bound> {
+        ensure!(
+            cfg!(feature = "embedded-runtime"),
+            "componentize-py was built without the `embedded-runtime` feature, so it can \
+             only assemble prepared assets"
+        );
+
         // This is a _big_ function.  Here's an overview of what it does.
         //
         // Our goal here is to collect one or more WIT paths, parse them, and
@@ -1180,8 +1194,8 @@ impl BuildEntropy {
 /// environment variables and preopens, the entropy in `entropy`, wall and
 /// monotonic clocks that start at zero and advance one microsecond per read,
 /// an empty stdin, and a trapping stub for each entry of `stubs`.  It then
-/// calls `componentize-py:init/exports#init` (see [`INIT_WIT`]) with
-/// `app_name`, `symbols` and `stub_wasi`.
+/// calls `componentize-py:init/exports#init` with `app_name`, `symbols` and
+/// `stub_wasi`.
 #[derive(Clone, Debug)]
 pub struct InitPlan {
     pub app_name: String,
@@ -1194,7 +1208,7 @@ pub struct InitPlan {
 }
 
 /// The WIT world of the runtime's initialization export.
-pub const INIT_WIT: &str = include_str!("../wit/init.wit");
+const INIT_WIT: &str = include_str!("../wit/init.wit");
 
 impl InitPlan {
     fn new(
@@ -1287,13 +1301,36 @@ fn add_wasi_and_stubs(stubs: &[ImportStub], linker: &mut Linker<Ctx>) -> Result<
     Ok(())
 }
 
-/// Pre-initializes `component` according to `plan` with this crate's own
-/// Wasmtime engine.
+/// The engine and host setup that run pre-initialization.
+///
+/// The engine must enable the component model and its async support.  The
+/// caller owns its other settings.
+pub struct Initializer<'a> {
+    pub engine: &'a Engine,
+    /// Adds the imports to the linker.  `None` adds WASIp2 and a trapping stub
+    /// for each import of the plan.
+    pub add_to_linker: AddToLinker<'a>,
+    /// Prepares the store before instantiation, for example to give it fuel or
+    /// an epoch deadline that the engine requires.
+    pub configure_store: ConfigureStore<'a>,
+}
+
+/// The engine that `componentize` and `assemble` use when the caller does not
+/// supply one.
+pub fn default_engine() -> Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_map(true);
+    Ok(Engine::new(&config)?)
+}
+
+/// Pre-initializes `component` according to `plan`.
 async fn initialize(
     component: &[u8],
     stubbed_component: component_init_transform::Stage2Map<'_>,
     plan: &InitPlan,
-    add_to_linker: AddToLinker<'_>,
+    initializer: Initializer<'_>,
 ) -> Result<Vec<u8>> {
     let stdout = MemoryOutputPipe::new(10000);
     let stderr = MemoryOutputPipe::new(10000);
@@ -1315,15 +1352,9 @@ async fn initialize(
     }
     let wasi = wasi.build();
 
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
-    config.wasm_component_model_map(true);
-
-    let engine = Engine::new(&config)?;
-
+    let engine = initializer.engine.clone();
     let mut linker = Linker::new(&engine);
-    if let Some(add_to_linker) = add_to_linker {
+    if let Some(add_to_linker) = initializer.add_to_linker {
         add_to_linker(&mut linker)?;
     } else {
         add_wasi_and_stubs(&plan.stubs, &mut linker)?;
@@ -1336,6 +1367,9 @@ async fn initialize(
             table: ResourceTable::new(),
         },
     );
+    if let Some(configure_store) = initializer.configure_store {
+        configure_store(&mut store)?;
+    }
 
     let app_name = plan.app_name.clone();
     let symbols = plan.symbols.clone();

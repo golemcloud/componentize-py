@@ -10,6 +10,16 @@ description = "Tool for targeting the WebAssembly Component Model using Python"
 name = "componentize_py"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "componentize-py"
+required-features = ["embedded-runtime"]
+
+[features]
+default = ["embedded-runtime"]
+# Builds CPython and the runtime into the crate.  Preparing assets and
+# `componentize` need it; reading and assembling prepared assets do not.
+embedded-runtime = []
+
 [dependencies]
 anyhow = { version = "1.0.91", features = ["backtrace"] }
 clap = { version = "4.5.20", features = ["derive"] }

@@ -1,6 +1,6 @@
 use {
     crate::{
-        BindingsGenerator, ComponentGenerator,
+        BindingsGenerator, ComponentGenerator, Initializer,
         prepared::{Assembler, BindingsPreparer, Prepared},
     },
     anyhow::{Context, Result, bail},
@@ -401,7 +401,12 @@ fn assemble(common: Common, assemble: Assemble) -> Result<()> {
         stack_size: assemble.stack_size,
     }
     .assemble()?;
-    let component = Runtime::new()?.block_on(assembly.initialize(None))?;
+    let engine = crate::default_engine()?;
+    let component = Runtime::new()?.block_on(assembly.initialize(Initializer {
+        engine: &engine,
+        add_to_linker: None,
+        configure_store: None,
+    }))?;
 
     if let Some(parent) = assemble.output.parent() {
         fs::create_dir_all(parent)?;

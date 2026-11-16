@@ -21,20 +21,24 @@ use {
         path::{Path, PathBuf},
         str,
     },
-    summary::{Locations, Summary},
     tar::Archive,
-    wasm_encoder::{CustomSection, Section as _},
     wasmtime::{
         Config, Engine, Store,
         component::{Component, Instance, Linker, ResourceTable, ResourceType},
     },
+    zstd::Decoder,
+};
+
+#[cfg(feature = "embedded-runtime")]
+use {
+    summary::{Locations, Summary},
+    wasm_encoder::{CustomSection, Section as _},
     wit_component::metadata,
     wit_dylib::DylibOpts,
     wit_parser::{
         CloneMaps, FunctionKind, Package, PackageId, PackageName, Resolve, Stability, TypeDefKind,
         World, WorldId, WorldItem, WorldKey,
     },
-    zstd::Decoder,
 };
 
 #[cfg(feature = "embedded-runtime")]
@@ -50,11 +54,15 @@ mod prelink;
 pub mod prepared;
 #[cfg(all(feature = "pyo3", feature = "embedded-runtime"))]
 mod python;
+#[cfg(feature = "embedded-runtime")]
 mod registry;
+#[cfg(feature = "embedded-runtime")]
 mod stubwasi;
+#[cfg(feature = "embedded-runtime")]
 mod summary;
 #[cfg(all(test, feature = "embedded-runtime"))]
 mod test;
+#[cfg(feature = "embedded-runtime")]
 mod util;
 
 const DEBUG_PYTHON_BINDINGS: bool = false;
@@ -241,6 +249,7 @@ impl<T: Send + 'static> Invoker for MyInvoker<T> {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 pub struct BindingsGenerator<'a> {
     pub wit_paths: &'a [&'a Path],
     pub worlds: &'a [&'a str],
@@ -256,6 +265,7 @@ pub struct BindingsGenerator<'a> {
     pub allow_existing: bool,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl BindingsGenerator<'_> {
     pub async fn generate(&self) -> Result<()> {
         // Here we parse the specified WIT paths and resolve the specified
@@ -383,6 +393,7 @@ pub(crate) fn warn_full_names_deprecated(full_names: Option<bool>, source: Optio
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Resolve the deprecated `world_module` spelling of `bindings_module`, warning
 /// about it and about `full_names`.
 pub(crate) fn resolve_deprecated(
@@ -405,6 +416,7 @@ pub(crate) fn resolve_deprecated(
     Ok(bindings_module.or(world_module))
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Reject `--bindings-module` values which are not importable Python paths.
 fn validate_bindings_module(module: &str) -> Result<()> {
     if module
@@ -417,6 +429,7 @@ fn validate_bindings_module(module: &str) -> Result<()> {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Make each ancestor of a dotted bindings module a regular package.
 fn create_module_ancestors(root: &Path, module: &str) -> Result<()> {
     let components = module.split('.').collect::<Vec<_>>();
@@ -433,6 +446,7 @@ fn create_module_ancestors(root: &Path, module: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Replace each helper placeholder with the module path generated for it; an
 /// unimported interface has no entry and keeps its placeholder.
 fn resolve_helper_placeholders(path: &Path, replacements: &[(&str, String)]) -> Result<()> {
@@ -1067,6 +1081,7 @@ impl ComponentGenerator<'_> {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// The owned result of processing the WIT inputs for one build.
 struct Bound {
     python_path: Vec<String>,
@@ -1096,6 +1111,7 @@ pub enum ImportStubKind {
     Resource,
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn import_stubs(resolve: &Resolve, worlds: &IndexSet<WorldId>) -> Vec<ImportStub> {
     let function = |interface: Option<&String>, name: &String, kind: &FunctionKind| ImportStub {
         interface: interface.cloned(),
@@ -1416,6 +1432,7 @@ pub async fn initialize_component<T: Send + 'static>(
     .await
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn parse_features(features: &[&str]) -> IndexSet<String> {
     features
         .iter()
@@ -1429,6 +1446,7 @@ fn parse_features(features: &[&str]) -> IndexSet<String> {
         .collect()
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn available_worlds(resolve: &Resolve) -> Vec<String> {
     resolve
         .worlds
@@ -1452,6 +1470,7 @@ fn available_worlds(resolve: &Resolve) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn select_world(
     resolve: &Resolve,
     world: Option<&str>,
@@ -1479,6 +1498,7 @@ fn select_world(
         })
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn union_world(
     resolve: &mut Resolve,
     name: &str,
@@ -1518,6 +1538,7 @@ fn union_world(
     Ok(union_world)
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn intersect_world(resolve: &mut Resolve, intersector: WorldId, world: WorldId) {
     let (imports_to_remove, exports_to_remove) = {
         let intersector = &resolve.worlds[intersector];
@@ -1559,6 +1580,7 @@ fn intersect_world(resolve: &mut Resolve, intersector: WorldId, world: WorldId) 
     world.exports.retain(|k, _| !exports_to_remove.contains(k));
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn is_wasip2_cli(interface_name: &str) -> bool {
     (interface_name.starts_with("wasi:cli/")
         || interface_name.starts_with("wasi:clocks/")

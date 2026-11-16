@@ -558,6 +558,7 @@ dependencies = [
  "clap",
  "component-init-transform",
  "componentize-py-test-generator",
+ "filetime",
  "flate2",
  "fs_extra",
  "futures",

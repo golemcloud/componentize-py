@@ -49,6 +49,8 @@ serde = { version = "1.0.213", features = ["derive"] }
 toml = "0.8.19"
 semver = "1.0.23"
 wit-bindgen-core = "0.61.0"
+sha2 = "0.10.9"
+filetime = "0.2.29"
 
 [dev-dependencies]
 assert_cmd = "2.0.16"

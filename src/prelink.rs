@@ -33,10 +33,9 @@ pub fn embedded_python_standard_library() -> Result<TempDir> {
     // directory
     let stdlib = tempfile::tempdir()?;
 
-    Archive::new(Decoder::new(Cursor::new(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/python-lib.tar.zst"
-    ))))?)
+    Archive::new(Decoder::new(Cursor::new(
+        embedded_python_standard_library_archive(),
+    ))?)
     .unpack(stdlib.path())
     .unwrap();
 
@@ -57,11 +56,22 @@ pub fn embedded_helper_utils() -> Result<TempDir> {
     Ok(bundled)
 }
 
+pub fn embedded_python_standard_library_archive() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/python-lib.tar.zst"))
+}
+
+pub fn embedded_adapter() -> Result<Vec<u8>> {
+    Ok(zstd::decode_all(Cursor::new(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/wasi_snapshot_preview1.reactor.wasm.zst"
+    ))))?)
+}
+
 /// Support libraries from the WASI SDK that extensions may depend on.  Each is
 /// linked only when a linked library names it in its `dylink.0` needed list.
-fn toolchain_support_libraries() -> Result<Vec<(&'static str, Vec<u8>)>> {
+pub fn toolchain_support_libraries() -> Result<Vec<(String, Vec<u8>)>> {
     Ok(vec![(
-        "libsetjmp.so",
+        "libsetjmp.so".to_owned(),
         zstd::decode_all(Cursor::new(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/libsetjmp.so.zst"
@@ -95,7 +105,11 @@ fn needed_libraries(module: &[u8]) -> Result<Vec<String>> {
 /// `dlopen`.  Support libraries that nothing needs are not linked, so they do
 /// not change the component.  A needed name that remains unresolved is reported
 /// by the linker as a missing library.
-fn add_support_libraries(libraries: &mut Vec<Library>, support: &[PathBuf]) -> Result<()> {
+pub fn add_support_libraries(
+    libraries: &mut Vec<Library>,
+    support: &[PathBuf],
+    toolchain: &[(String, Vec<u8>)],
+) -> Result<()> {
     let mut candidates: IndexMap<String, Vec<(String, Vec<u8>)>> = IndexMap::new();
     for path in support {
         let name = path
@@ -109,8 +123,6 @@ fn add_support_libraries(libraries: &mut Vec<Library>, support: &[PathBuf]) -> R
             .or_default()
             .push((path.display().to_string(), module));
     }
-    let toolchain = toolchain_support_libraries()?;
-
     let mut index = 0;
     while index < libraries.len() {
         for needed in needed_libraries(&libraries[index].module)? {
@@ -249,7 +261,7 @@ pub fn bundle_libraries(
         }
     }
 
-    add_support_libraries(&mut libraries, support)?;
+    add_support_libraries(&mut libraries, support, &toolchain_support_libraries()?)?;
 
     Ok(libraries)
 }
@@ -333,15 +345,15 @@ fn search_directory(
     modules_seen: &mut HashSet<String>,
 ) -> Result<()> {
     if path.is_dir() {
-        for entry in fs::read_dir(path).with_context(|| path.display().to_string())? {
-            search_directory(
-                root,
-                &entry?.path(),
-                libraries,
-                support,
-                configs,
-                modules_seen,
-            )?;
+        // Sort the entries so that the order of the libraries found, and so
+        // the linked component, does not depend on the file system.
+        let mut entries = fs::read_dir(path)
+            .with_context(|| path.display().to_string())?
+            .map(|entry| Ok(entry?.path()))
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort();
+        for entry in entries {
+            search_directory(root, &entry, libraries, support, configs, modules_seen)?;
         }
     } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
         if NATIVE_EXTENSION_SUFFIXES

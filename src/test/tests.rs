@@ -1085,6 +1085,7 @@ fn componentize_app(
             output_path: &tempdir.join("app.wasm"),
             add_to_linker: None,
             stub_wasi: false,
+            stack_size: None,
             import_interface_names: &std::collections::HashMap::new(),
             export_interface_names: &std::collections::HashMap::new(),
             intersect_world: None,

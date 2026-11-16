@@ -457,6 +457,9 @@ pub struct ComponentGenerator<'a> {
     pub output_path: &'a Path,
     pub add_to_linker: AddToLinker<'a>,
     pub stub_wasi: bool,
+    /// Size in bytes of the linear-memory stack shared by C code, which
+    /// CPython's recursion guard measures.  `None` keeps the linker default.
+    pub stack_size: Option<u32>,
     pub import_interface_names: &'a HashMap<&'a str, &'a str>,
     pub export_interface_names: &'a HashMap<&'a str, &'a str>,
     pub intersect_world: Option<&'a str>,
@@ -863,7 +866,7 @@ impl ComponentGenerator<'_> {
             dl_openable: false,
         });
 
-        let component = link::link_libraries(&libraries)?;
+        let component = link::link_libraries(&libraries, self.stack_size)?;
 
         let stubbed_component = if self.stub_wasi {
             stubwasi::link_stub_modules(libraries)?

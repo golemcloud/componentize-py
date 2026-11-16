@@ -1,4 +1,7 @@
 #![deny(warnings)]
+// Without the embedded runtime the crate only reads and assembles prepared
+// assets, so the code that prepares them is unused.
+#![cfg_attr(not(feature = "embedded-runtime"), allow(dead_code, unused_imports))]
 
 use {
     anyhow::{Context, Error, Result, anyhow, bail, ensure},
@@ -25,10 +28,6 @@ use {
         Config, Engine, Store,
         component::{Component, Instance, Linker, ResourceTable, ResourceType},
     },
-    wasmtime_wasi::{
-        Deterministic, FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
-        p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-    },
     wit_component::metadata,
     wit_dylib::DylibOpts,
     wit_parser::{
@@ -38,16 +37,23 @@ use {
     zstd::Decoder,
 };
 
+#[cfg(feature = "embedded-runtime")]
+use wasmtime_wasi::{
+    Deterministic, FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
+};
+
+#[cfg(feature = "embedded-runtime")]
 pub mod command;
 mod link;
 mod prelink;
 pub mod prepared;
-#[cfg(feature = "pyo3")]
+#[cfg(all(feature = "pyo3", feature = "embedded-runtime"))]
 mod python;
 mod registry;
 mod stubwasi;
 mod summary;
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded-runtime"))]
 mod test;
 mod util;
 
@@ -65,11 +71,13 @@ wasmtime::component::bindgen!({
 
 pub use {component_init_transform::Invoker, exports::exports::Symbols};
 
+#[cfg(feature = "embedded-runtime")]
 pub struct Ctx {
     wasi: WasiCtx,
     table: ResourceTable,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl WasiView for Ctx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -83,15 +91,18 @@ impl WasiView for Ctx {
 /// advances one microsecond each time it is read, so nothing the application
 /// saves depends on when it was built, and code waiting for time to pass still
 /// finishes.
+#[cfg(feature = "embedded-runtime")]
 #[derive(Default)]
 struct BuildClock(std::sync::atomic::AtomicU64);
 
+#[cfg(feature = "embedded-runtime")]
 impl BuildClock {
     fn tick(&self) -> u64 {
         self.0.fetch_add(1000, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl wasmtime_wasi::HostWallClock for BuildClock {
     fn resolution(&self) -> std::time::Duration {
         std::time::Duration::from_micros(1)
@@ -102,6 +113,7 @@ impl wasmtime_wasi::HostWallClock for BuildClock {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl wasmtime_wasi::HostMonotonicClock for BuildClock {
     fn resolution(&self) -> u64 {
         1000
@@ -122,6 +134,9 @@ fn set_build_mtimes(path: &Path) -> Result<()> {
     }
     // `FileTime::zero` is the platform epoch, which Windows cannot set.
     let epoch = filetime::FileTime::from_unix_time(0, 0);
+    // Newer `filetime` releases deprecate this in favor of `std::fs::set_times`,
+    // which does not set the times of directories on every platform.
+    #[allow(deprecated)]
     filetime::set_file_times(path, epoch, epoch).with_context(|| path.display().to_string())
 }
 
@@ -183,13 +198,13 @@ pub struct ConfigContext<T> {
     config: T,
 }
 
-struct MyInvoker {
-    store: Store<Ctx>,
+struct MyInvoker<T: 'static> {
+    store: Store<T>,
     instance: Instance,
 }
 
 #[async_trait]
-impl Invoker for MyInvoker {
+impl<T: Send + 'static> Invoker for MyInvoker<T> {
     async fn call_s32(&mut self, function: &str) -> Result<i32> {
         let func = self
             .instance
@@ -447,11 +462,10 @@ fn resolve_helper_placeholders(path: &Path, replacements: &[(&str, String)]) -> 
     Ok(())
 }
 
+#[cfg(feature = "embedded-runtime")]
 pub type AddToLinker<'a> = Option<&'a dyn Fn(&mut Linker<Ctx>) -> Result<()>>;
 
-/// Prepares the store of pre-initialization; see [`Initializer::configure_store`].
-pub type ConfigureStore<'a> = Option<&'a dyn Fn(&mut Store<Ctx>) -> Result<()>>;
-
+#[cfg(feature = "embedded-runtime")]
 pub struct ComponentGenerator<'a> {
     pub wit_paths: &'a [&'a Path],
     pub worlds: &'a [&'a str],
@@ -474,6 +488,7 @@ pub struct ComponentGenerator<'a> {
     pub default_registries: bool,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl ComponentGenerator<'_> {
     pub async fn generate(&self) -> Result<()> {
         let bound = self.bind().await?;
@@ -521,18 +536,14 @@ impl ComponentGenerator<'_> {
             &component,
         );
 
-        let engine = default_engine()?;
         let component = initialize(
             &component,
             stubbed_component
                 .as_ref()
                 .map(|(component, map)| (component.deref(), map as &dyn Fn(u32) -> u32)),
             &plan,
-            Initializer {
-                engine: &engine,
-                add_to_linker: self.add_to_linker,
-                configure_store: None,
-            },
+            &default_engine()?,
+            self.add_to_linker,
         )
         .await?;
 
@@ -1252,9 +1263,10 @@ impl InitPlan {
     }
 }
 
-fn add_wasi_and_stubs(stubs: &[ImportStub], linker: &mut Linker<Ctx>) -> Result<()> {
-    wasmtime_wasi::p2::add_to_linker_async(linker)?;
-
+/// Adds a trapping stub to `linker` for each import in `stubs`.
+///
+/// An initializer adds WASIp2 first, then these stubs.
+pub fn add_trapping_stubs<T: 'static>(linker: &mut Linker<T>, stubs: &[ImportStub]) -> Result<()> {
     let mut by_interface = IndexMap::<_, Vec<_>>::new();
     for stub in stubs {
         by_interface
@@ -1301,22 +1313,7 @@ fn add_wasi_and_stubs(stubs: &[ImportStub], linker: &mut Linker<Ctx>) -> Result<
     Ok(())
 }
 
-/// The engine and host setup that run pre-initialization.
-///
-/// The engine must enable the component model and its async support.  The
-/// caller owns its other settings.
-pub struct Initializer<'a> {
-    pub engine: &'a Engine,
-    /// Adds the imports to the linker.  `None` adds WASIp2 and a trapping stub
-    /// for each import of the plan.
-    pub add_to_linker: AddToLinker<'a>,
-    /// Prepares the store before instantiation, for example to give it fuel or
-    /// an epoch deadline that the engine requires.
-    pub configure_store: ConfigureStore<'a>,
-}
-
-/// The engine that `componentize` and `assemble` use when the caller does not
-/// supply one.
+/// The engine that `componentize` and `assemble` use.
 pub fn default_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
@@ -1325,12 +1322,15 @@ pub fn default_engine() -> Result<Engine> {
     Ok(Engine::new(&config)?)
 }
 
-/// Pre-initializes `component` according to `plan`.
+/// Pre-initializes `component` according to `plan`, with this crate's WASI
+/// implementation on `engine`.
+#[cfg(feature = "embedded-runtime")]
 async fn initialize(
     component: &[u8],
     stubbed_component: component_init_transform::Stage2Map<'_>,
     plan: &InitPlan,
-    initializer: Initializer<'_>,
+    engine: &Engine,
+    add_to_linker: AddToLinker<'_>,
 ) -> Result<Vec<u8>> {
     let stdout = MemoryOutputPipe::new(10000);
     let stderr = MemoryOutputPipe::new(10000);
@@ -1352,30 +1352,53 @@ async fn initialize(
     }
     let wasi = wasi.build();
 
-    let engine = initializer.engine.clone();
-    let mut linker = Linker::new(&engine);
-    if let Some(add_to_linker) = initializer.add_to_linker {
+    let mut linker = Linker::new(engine);
+    if let Some(add_to_linker) = add_to_linker {
         add_to_linker(&mut linker)?;
     } else {
-        add_wasi_and_stubs(&plan.stubs, &mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        add_trapping_stubs(&mut linker, &plan.stubs)?;
     }
 
-    let mut store = Store::new(
-        &engine,
+    let store = Store::new(
+        engine,
         Ctx {
             wasi,
             table: ResourceTable::new(),
         },
     );
-    if let Some(configure_store) = initializer.configure_store {
-        configure_store(&mut store)?;
-    }
 
+    initialize_component(component, stubbed_component, plan, store, linker)
+        .await
+        .with_context(move || {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&stdout.try_into_inner().unwrap()),
+                String::from_utf8_lossy(&stderr.try_into_inner().unwrap())
+            )
+        })
+}
+
+/// Pre-initializes `component` according to `plan` with the caller's store
+/// and linker, and returns the initialized component.
+///
+/// The store's engine must enable the component model and its async support.
+/// The store must provide the WASI context that `plan` describes, and the
+/// linker must provide WASIp2 and the plan's stubs; see [`InitPlan`] and
+/// [`add_trapping_stubs`].
+pub async fn initialize_component<T: Send + 'static>(
+    component: &[u8],
+    stubbed_component: component_init_transform::Stage2Map<'_>,
+    plan: &InitPlan,
+    mut store: Store<T>,
+    linker: Linker<T>,
+) -> Result<Vec<u8>> {
     let app_name = plan.app_name.clone();
     let symbols = plan.symbols.clone();
     let stub_wasi = plan.stub_wasi;
     component_init_transform::initialize_staged(component, stubbed_component, move |instrumented| {
         async move {
+            let engine = store.engine().clone();
             let component = &Component::new(&engine, instrumented)?;
             let pre = InitPre::new(linker.instantiate_pre(component)?)?;
             let instance = pre.instance_pre.instantiate_async(&mut store).await?;
@@ -1391,13 +1414,6 @@ async fn initialize(
         .boxed()
     })
     .await
-    .with_context(move || {
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&stdout.try_into_inner().unwrap()),
-            String::from_utf8_lossy(&stderr.try_into_inner().unwrap())
-        )
-    })
 }
 
 fn parse_features(features: &[&str]) -> IndexSet<String> {

@@ -7,15 +7,16 @@
 //! [`Prepared::read`] loads and verifies them in another process.
 //! [`Assembler`] then links the prepared assets with an application and its
 //! native extensions, without WIT processing or code generation, and
-//! [`Assembly::initialize`] pre-initializes the result on the caller's engine.
+//! [`Assembly::initialize`] pre-initializes the result with the caller's store
+//! and linker.
 //!
 //! Reading and assembling prepared assets does not need the `embedded-runtime`
 //! feature; preparing them does.
 
 use {
     crate::{
-        ComponentGenerator, ImportStub, InitPlan, Initializer, Library, Preopen, Symbols,
-        initialize, link, prelink, set_build_mtimes,
+        ImportStub, InitPlan, Library, Preopen, Symbols, initialize_component, link, prelink,
+        set_build_mtimes,
     },
     anyhow::{Context, Result, bail, ensure},
     serde::{Deserialize, Serialize},
@@ -28,6 +29,7 @@ use {
     },
     tar::{Archive, Builder, HeaderMode},
     tempfile::TempDir,
+    wasmtime::{Store, component::Linker},
     zstd::Decoder,
 };
 
@@ -252,11 +254,15 @@ fn unpack(archive: &[u8], compressed: bool) -> Result<TempDir> {
     Ok(dir)
 }
 
+#[cfg(feature = "embedded-runtime")]
+use crate::ComponentGenerator;
+
 /// Prepares the assets for a WIT world.
 ///
 /// The fields have the same meaning as in [`ComponentGenerator`].  Per-module
 /// `componentize-py.toml` configuration does not apply, because preparation
 /// does not search a Python path.
+#[cfg(feature = "embedded-runtime")]
 pub struct BindingsPreparer<'a> {
     pub wit_paths: &'a [&'a Path],
     pub worlds: &'a [&'a str],
@@ -270,6 +276,7 @@ pub struct BindingsPreparer<'a> {
     pub default_registries: bool,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl BindingsPreparer<'_> {
     pub async fn prepare(&self) -> Result<Prepared> {
         let bound = ComponentGenerator {
@@ -450,9 +457,27 @@ impl Assembler<'_> {
 }
 
 impl Assembly {
-    /// Pre-initializes the component on the initializer's engine and returns
-    /// the initialized component.
-    pub async fn initialize(&self, initializer: Initializer<'_>) -> Result<Vec<u8>> {
-        initialize(&self.component, None, &self.plan, initializer).await
+    /// Pre-initializes the component with the caller's store and linker; see
+    /// [`initialize_component`].
+    pub async fn initialize<T: Send + 'static>(
+        &self,
+        store: Store<T>,
+        linker: Linker<T>,
+    ) -> Result<Vec<u8>> {
+        initialize_component(&self.component, None, &self.plan, store, linker).await
+    }
+
+    /// Pre-initializes the component with this crate's WASI implementation and
+    /// [`default_engine`].
+    #[cfg(feature = "embedded-runtime")]
+    pub async fn initialize_default(&self) -> Result<Vec<u8>> {
+        crate::initialize(
+            &self.component,
+            None,
+            &self.plan,
+            &crate::default_engine()?,
+            None,
+        )
+        .await
     }
 }

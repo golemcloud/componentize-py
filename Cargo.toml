@@ -18,7 +18,8 @@ required-features = ["embedded-runtime"]
 default = ["embedded-runtime"]
 # Builds CPython and the runtime into the crate.  Preparing assets and
 # `componentize` need it; reading and assembling prepared assets do not.
-embedded-runtime = []
+embedded-runtime = ["dep:wasmtime-wasi"]
+pyo3 = ["dep:pyo3", "embedded-runtime"]
 
 [dependencies]
 anyhow = { version = "1.0.91", features = ["backtrace"] }
@@ -39,7 +40,7 @@ pyo3 = { version = "0.28.3", features = [
     "extension-module",
 ], optional = true }
 wasmtime = "50.0.1"
-wasmtime-wasi = { version = "50.0.1", features = [ "p3" ] }
+wasmtime-wasi = { version = "50.0.1", features = [ "p3" ], optional = true }
 wasm-pkg-client = "0.16.1"
 once_cell = "1.20.2"
 component-init-transform = "0.3.1"
@@ -56,7 +57,7 @@ pretty_env_logger = "0.5.0"
 cap-std = "3.3.0"
 im-rc = "15.1.0"
 serde = { version = "1.0.213", features = ["derive"] }
-serde_json = "1.0.154"
+serde_json = "1.0"
 toml = "0.8.19"
 semver = "1.0.23"
 wit-bindgen-core = "0.61.0"

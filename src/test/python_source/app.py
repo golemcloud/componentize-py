@@ -209,6 +209,16 @@ async def write_host_thing(thing: host_thing_interface.HostThing,
     wrote = await tx2.write(thing)
     assert wrote
 
+def expect_moved(call):
+    # The handle was given away by the previous call, so lowering it again
+    # must fail in the guest before the host sees a second call.
+    try:
+        call()
+    except ValueError as error:
+        assert "already moved or dropped" in str(error), error
+    else:
+        unreachable()
+
 def unreachable() -> str:
     raise AssertionError
         
@@ -275,23 +285,20 @@ class Tests(tests.WorldExports):
         for _ in range(5 * 1024):
             chunk = tests.get_bytes(1024 * 1024)
 
-    def trap_on_empty_resource(self, thing: imports.resource_alias1.Thing):
+    def reject_moved_resource(self, thing: imports.resource_alias1.Thing):
         tests.take_thing(thing)
-        tests.take_thing(thing) # should trap since we already gave away `thing`
-        unreachable()
-        
-    def trap_on_empty_future(self):
+        expect_moved(lambda: tests.take_thing(thing))
+
+    def reject_moved_future(self):
         tx, rx = tests.unit_future(lambda: None)
         tests.take_future(rx)
-        tests.take_future(rx) # should trap since we already gave away `rx`
-        unreachable()
-        
-    def trap_on_empty_stream(self):
+        expect_moved(lambda: tests.take_future(rx))
+
+    def reject_moved_stream(self):
         tx, rx = tests.unit_stream()
         tests.take_stream(rx)
-        tests.take_stream(rx) # should trap since we already gave away `rx`
-        unreachable()
-   
+        expect_moved(lambda: tests.take_stream(rx))
+
 @foo_iface.guest
 class FooInterface(foo_exports.FooInterface):
     def test(self, s: str) -> str:

@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14.0"
+          python-version: "3.14.10"
 
       - name: Install latest Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -120,7 +120,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14.0"
+          python-version: "3.14.10"
 
       - name: Test
         shell: bash

@@ -15,8 +15,8 @@ use {
         exceptions::{PyOverflowError, PyTypeError, PyValueError},
         intern,
         types::{
-            PyAnyMethods, PyBytes, PyDict, PyDictMethods, PyFloat, PyInt, PyList, PyListMethods,
-            PyString, PyStringMethods, PyTuple, PyTupleMethods, PyTypeMethods,
+            PyAnyMethods, PyBytes, PyDict, PyDictMethods, PyList, PyListMethods, PyString,
+            PyStringMethods, PyTuple, PyTupleMethods, PyTypeMethods,
         },
     },
     wit_dylib_ffi::Type,
@@ -39,18 +39,7 @@ pub fn check(
         Type::S32 => int::<i32>(value, "s32", path),
         Type::S64 => int::<i64>(value, "s64", path),
         Type::Bool => Ok(()),
-        Type::F32 | Type::F64 => {
-            if value.is_instance_of::<PyFloat>() || value.is_instance_of::<PyInt>() {
-                value.extract::<f64>().map(drop).map_err(|_| {
-                    PyOverflowError::new_err(format!(
-                        "{path}: {} is out of range for a float",
-                        repr(value)
-                    ))
-                })
-            } else {
-                Err(type_error("float", value, path))
-            }
-        }
+        Type::F32 | Type::F64 => number::<f64>(value, "float", "a float", path),
         Type::Char => {
             let s = value
                 .cast::<PyString>()
@@ -268,14 +257,27 @@ fn int<'py, T: for<'a> pyo3::FromPyObject<'a, 'py>>(
     name: &str,
     path: &str,
 ) -> PyResult<()> {
-    if !value.is_instance_of::<PyInt>() {
-        return Err(type_error(name, value, path));
-    }
-    value.extract::<T>().map(drop).map_err(|_| {
-        PyOverflowError::new_err(format!(
-            "{path}: {} is out of range for {name}",
-            repr(value)
-        ))
+    number::<T>(value, name, name, path)
+}
+
+/// Accepts what the lowering accepts: the extraction goes through
+/// `__index__` for integers and `__float__` for floats, so `numpy.int64` and
+/// other number types are valid, and only the error is translated.
+fn number<'py, T: for<'a> pyo3::FromPyObject<'a, 'py>>(
+    value: &Bound<'py, PyAny>,
+    name: &str,
+    range: &str,
+    path: &str,
+) -> PyResult<()> {
+    value.extract::<T>().map(drop).map_err(|error| {
+        if error.is_instance_of::<PyOverflowError>(value.py()) {
+            PyOverflowError::new_err(format!(
+                "{path}: {} is out of range for {range}",
+                repr(value)
+            ))
+        } else {
+            type_error(name, value, path)
+        }
     })
 }
 

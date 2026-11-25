@@ -329,6 +329,10 @@ fn maybe_make_cpython(repo_dir: &Path, wasi_sdk: &Path) -> Result<()> {
     let mut patches = fs::read_dir(&patch_dir)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
+    patches.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "patch")
+    });
     patches.sort();
     let identity = cpython_source_identity(&patches)?;
 
@@ -346,8 +350,13 @@ fn maybe_make_cpython(repo_dir: &Path, wasi_sdk: &Path) -> Result<()> {
             "https://www.python.org/ftp/python/{CPYTHON_VERSION}/Python-{CPYTHON_VERSION}.tgz"
         );
         println!("cargo:warning=downloading CPython source code from {url}");
-        fetch_extract(&url, Some(CPYTHON_TARBALL_SHA256), repo_dir)?;
+        // An interrupted build can leave a partly patched tree behind, which
+        // the patches would not apply to again.
         let source_dir = repo_dir.join(format!("Python-{CPYTHON_VERSION}"));
+        if source_dir.exists() {
+            fs::remove_dir_all(&source_dir)?;
+        }
+        fetch_extract(&url, Some(CPYTHON_TARBALL_SHA256), repo_dir)?;
 
         for patch in &patches {
             run(Command::new("patch")

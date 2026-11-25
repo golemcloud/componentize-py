@@ -885,10 +885,12 @@ impl ComponentGenerator<'_> {
 
         // Pre-initialization saves everything the application computes into
         // the component, so derive its hash seed and random bytes from the
-        // linked component instead of from host entropy.  Identical inputs then
-        // produce identical components.  The runtime reseeds `random` from the
-        // host before the first export call.
-        let digest = Sha256::digest(&component);
+        // linked component and the application's sources instead of from host
+        // entropy.  Identical inputs then produce identical components, and
+        // applications that share the same libraries still get different
+        // values.  The runtime reseeds `random` from the host before the first
+        // export call.
+        let digest = build_digest(&component, self.app_name, python_path)?;
         let random_bytes = (0u32..1024)
             .flat_map(|counter| {
                 Sha256::new()
@@ -1410,4 +1412,51 @@ fn is_wasip2_cli(interface_name: &str) -> bool {
         || interface_name.starts_with("wasi:filesystem/")
         || interface_name.starts_with("wasi:sockets/"))
         && interface_name.contains("@0.2.")
+}
+
+/// Returns the SHA-256 of the linked component, the application name and the
+/// relative path and content of every file in each Python path entry, in
+/// sorted order. A symbolic link counts as its target path, not as the content
+/// it points to.
+fn build_digest(component: &[u8], app_name: &str, python_path: &[&str]) -> Result<[u8; 32]> {
+    fn update_tree(hasher: &mut Sha256, root: &Path, path: &Path) -> Result<()> {
+        let relative = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_symlink() {
+            hasher.update(b"l");
+            hasher.update(fs::read_link(path)?.to_string_lossy().as_bytes());
+            hasher.update([0]);
+        } else if metadata.is_dir() {
+            hasher.update(b"d");
+            let mut entries = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort();
+            for entry in entries {
+                update_tree(hasher, root, &entry)?;
+            }
+        } else {
+            let content = fs::read(path)?;
+            hasher.update(b"f");
+            hasher.update((content.len() as u64).to_le_bytes());
+            hasher.update(&content);
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(Sha256::digest(component));
+    hasher.update(app_name.as_bytes());
+    hasher.update([0]);
+    for (index, entry) in python_path.iter().enumerate() {
+        hasher.update((index as u64).to_le_bytes());
+        let root = fs::canonicalize(entry)?;
+        update_tree(&mut hasher, &root, &root)?;
+    }
+    Ok(hasher.finalize().into())
 }

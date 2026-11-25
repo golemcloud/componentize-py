@@ -241,6 +241,8 @@ world tests {
 
   export test-refcounts: func();
 
+  export lower-numbers: func() -> u32;
+
   export reject-moved-resource: func(thing: thing);
 
   import take-thing: func(thing: thing);

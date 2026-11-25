@@ -285,6 +285,22 @@ class Tests(tests.WorldExports):
         for _ in range(5 * 1024):
             chunk = tests.get_bytes(1024 * 1024)
 
+    def lower_numbers(self) -> int:
+        # Lowering takes any object with __index__, as numpy integers have,
+        # so the check before it accepts them too.
+        class Index:
+            def __index__(self) -> int:
+                return 40
+
+        for value, error in ((2**32, OverflowError), ("40", TypeError), (40.5, TypeError)):
+            try:
+                simple_import_and_export.foo(value)
+            except error:
+                pass
+            else:
+                unreachable()
+        return simple_import_and_export.foo(Index())
+
     def reject_moved_resource(self, thing: imports.resource_alias1.Thing):
         tests.take_thing(thing)
         expect_moved(lambda: tests.take_thing(thing))

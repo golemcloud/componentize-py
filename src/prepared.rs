@@ -442,8 +442,13 @@ impl Assembler<'_> {
             false,
             preopens,
             &python_path,
+            &self
+                .python_path
+                .iter()
+                .map(|&(_, path)| path)
+                .collect::<Vec<_>>(),
             &component,
-        );
+        )?;
 
         Ok(Assembly {
             component,

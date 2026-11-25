@@ -547,8 +547,9 @@ impl ComponentGenerator<'_> {
             self.stub_wasi,
             preopens,
             &python_path,
+            &bound.python_path.iter().map(Path::new).collect::<Vec<_>>(),
             &component,
-        );
+        )?;
 
         let component = initialize(
             &component,
@@ -1180,7 +1181,7 @@ impl Preopen {
     }
 }
 
-/// Entropy for pre-initialization, derived from the linked component so that
+/// Entropy for pre-initialization, derived from the build inputs so that
 /// identical inputs produce identical output.
 ///
 /// Pre-initialization saves everything the application computes into the
@@ -1198,9 +1199,16 @@ pub struct BuildEntropy {
 }
 
 impl BuildEntropy {
-    pub fn for_component(component: &[u8]) -> Self {
-        let digest = Sha256::digest(component);
-        Self {
+    /// Derives the entropy from the linked component, the application name
+    /// and the files of the application's Python path entries, so that
+    /// applications built from the same prepared assets get different values.
+    pub fn for_inputs(
+        component: &[u8],
+        app_name: &str,
+        python_path: &[impl AsRef<Path>],
+    ) -> Result<Self> {
+        let digest = build_digest(component, app_name, python_path)?;
+        Ok(Self {
             hash_seed: u32::from_le_bytes(digest[..4].try_into().unwrap()),
             random_bytes: (0u32..1024)
                 .flat_map(|counter| {
@@ -1211,7 +1219,7 @@ impl BuildEntropy {
                 })
                 .collect(),
             insecure_seed: u128::from_le_bytes(digest[..16].try_into().unwrap()),
-        }
+        })
     }
 }
 
@@ -1245,9 +1253,10 @@ impl InitPlan {
         stub_wasi: bool,
         preopens: Vec<Preopen>,
         python_path: &[String],
+        sources: &[&Path],
         component: &[u8],
-    ) -> Self {
-        let entropy = BuildEntropy::for_component(component);
+    ) -> Result<Self> {
+        let entropy = BuildEntropy::for_inputs(component, app_name, sources)?;
         let python_path = iter::once("/python")
             .chain(iter::once("/world"))
             .chain(python_path.iter().map(String::as_str))
@@ -1267,7 +1276,7 @@ impl InitPlan {
         .map(|(key, value)| (key.to_owned(), value))
         .collect();
 
-        Self {
+        Ok(Self {
             app_name: app_name.to_owned(),
             symbols,
             stubs,
@@ -1275,7 +1284,7 @@ impl InitPlan {
             env,
             preopens,
             entropy,
-        }
+        })
     }
 }
 
@@ -1589,4 +1598,55 @@ fn is_wasip2_cli(interface_name: &str) -> bool {
         || interface_name.starts_with("wasi:filesystem/")
         || interface_name.starts_with("wasi:sockets/"))
         && interface_name.contains("@0.2.")
+}
+
+/// Returns the SHA-256 of the linked component, the application name and the
+/// relative path and content of every file in each Python path entry, in
+/// sorted order. A symbolic link counts as its target path, not as the content
+/// it points to.
+fn build_digest(
+    component: &[u8],
+    app_name: &str,
+    python_path: &[impl AsRef<Path>],
+) -> Result<[u8; 32]> {
+    fn update_tree(hasher: &mut Sha256, root: &Path, path: &Path) -> Result<()> {
+        let relative = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_symlink() {
+            hasher.update(b"l");
+            hasher.update(fs::read_link(path)?.to_string_lossy().as_bytes());
+            hasher.update([0]);
+        } else if metadata.is_dir() {
+            hasher.update(b"d");
+            let mut entries = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort();
+            for entry in entries {
+                update_tree(hasher, root, &entry)?;
+            }
+        } else {
+            let content = fs::read(path)?;
+            hasher.update(b"f");
+            hasher.update((content.len() as u64).to_le_bytes());
+            hasher.update(&content);
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(Sha256::digest(component));
+    hasher.update(app_name.as_bytes());
+    hasher.update([0]);
+    for (index, entry) in python_path.iter().enumerate() {
+        hasher.update((index as u64).to_le_bytes());
+        let root = fs::canonicalize(entry.as_ref())?;
+        update_tree(&mut hasher, &root, &root)?;
+    }
+    Ok(hasher.finalize().into())
 }

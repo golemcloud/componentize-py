@@ -1247,6 +1247,14 @@ fn filesystem() -> Result<()> {
 }
 
 #[test]
+fn lower_numbers() -> Result<()> {
+    TESTER.test(|world, store, runtime| {
+        assert_eq!(40 + 2, runtime.block_on(world.call_lower_numbers(store))?);
+        Ok(())
+    })
+}
+
+#[test]
 fn reject_moved_resource() -> Result<()> {
     TESTER.test(|world, store, runtime| {
         runtime.block_on(async {

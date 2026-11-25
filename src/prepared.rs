@@ -15,8 +15,8 @@
 
 use {
     crate::{
-        ImportStub, InitPlan, Library, Preopen, Symbols, initialize_component, link, prelink,
-        set_build_mtimes,
+        BuildEntropy, ImportStub, InitPlan, Library, Preopen, Symbols, initialize_component, link,
+        prelink, set_build_mtimes,
     },
     anyhow::{Context, Result, bail, ensure},
     serde::{Deserialize, Serialize},
@@ -24,7 +24,7 @@ use {
     std::{
         collections::{BTreeMap, HashMap, HashSet},
         fs,
-        io::Cursor,
+        io::{Cursor, Read},
         path::{Path, PathBuf},
     },
     tar::{Archive, Builder, HeaderMode},
@@ -91,8 +91,9 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Line endings are normalized, because a checkout can convert them.
 fn init_wit_digest() -> String {
-    digest(crate::INIT_WIT.as_bytes())
+    digest(crate::INIT_WIT.replace("\r\n", "\n").as_bytes())
 }
 
 impl Prepared {
@@ -246,12 +247,31 @@ fn pack(dir: &Path) -> Result<Vec<u8>> {
 fn unpack(archive: &[u8], compressed: bool) -> Result<TempDir> {
     let dir = tempfile::tempdir()?;
     if compressed {
-        Archive::new(Decoder::new(Cursor::new(archive))?).unpack(dir.path())?;
+        unpack_entries(
+            Archive::new(Decoder::new(Cursor::new(archive))?),
+            dir.path(),
+        )?;
     } else {
-        Archive::new(Cursor::new(archive)).unpack(dir.path())?;
+        unpack_entries(Archive::new(Cursor::new(archive)), dir.path())?;
     }
     set_build_mtimes(dir.path())?;
     Ok(dir)
+}
+
+/// Unpacks only regular files and directories.  Preparation writes no other
+/// entries, and a link could point the build-time updates outside `dir`.
+fn unpack_entries(mut archive: Archive<impl Read>, dir: &Path) -> Result<()> {
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let kind = entry.header().entry_type();
+        ensure!(
+            kind.is_file() || kind.is_dir(),
+            "prepared asset entry {} is neither a file nor a directory",
+            entry.path()?.display()
+        );
+        entry.unpack_in(dir)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "embedded-runtime")]
@@ -442,13 +462,16 @@ impl Assembler<'_> {
             false,
             preopens,
             &python_path,
-            &self
-                .python_path
-                .iter()
-                .map(|&(_, path)| path)
-                .collect::<Vec<_>>(),
-            &component,
-        )?;
+            BuildEntropy::for_inputs(
+                &component,
+                self.app_name,
+                &self
+                    .python_path
+                    .iter()
+                    .map(|&(_, path)| path)
+                    .collect::<Vec<_>>(),
+            )?,
+        );
 
         Ok(Assembly {
             component,
@@ -484,5 +507,43 @@ impl Assembly {
             None,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::unpack,
+        tar::{Builder, EntryType, Header},
+    };
+
+    fn archive(kind: EntryType, link: Option<&str>) -> Vec<u8> {
+        let mut builder = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_mode(0o644);
+        header.set_size(0);
+        if let Some(link) = link {
+            header.set_link_name(link).unwrap();
+        }
+        builder.append_data(&mut header, "entry", &[][..]).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn unpack_rejects_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().to_str().unwrap();
+        for kind in [EntryType::Symlink, EntryType::Link] {
+            let error = unpack(&archive(kind, Some(target)), false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("entry entry is neither a file nor a directory"),
+                "{error}"
+            );
+        }
+        let unpacked = unpack(&archive(EntryType::Regular, None), false).unwrap();
+        assert!(unpacked.path().join("entry").is_file());
     }
 }

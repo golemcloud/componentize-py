@@ -547,9 +547,12 @@ impl ComponentGenerator<'_> {
             self.stub_wasi,
             preopens,
             &python_path,
-            &bound.python_path.iter().map(Path::new).collect::<Vec<_>>(),
-            &component,
-        )?;
+            BuildEntropy::for_inputs(
+                &component,
+                self.app_name,
+                &bound.python_path.iter().map(Path::new).collect::<Vec<_>>(),
+            )?,
+        );
 
         let component = initialize(
             &component,
@@ -1253,10 +1256,8 @@ impl InitPlan {
         stub_wasi: bool,
         preopens: Vec<Preopen>,
         python_path: &[String],
-        sources: &[&Path],
-        component: &[u8],
-    ) -> Result<Self> {
-        let entropy = BuildEntropy::for_inputs(component, app_name, sources)?;
+        entropy: BuildEntropy,
+    ) -> Self {
         let python_path = iter::once("/python")
             .chain(iter::once("/world"))
             .chain(python_path.iter().map(String::as_str))
@@ -1276,7 +1277,7 @@ impl InitPlan {
         .map(|(key, value)| (key.to_owned(), value))
         .collect();
 
-        Ok(Self {
+        Self {
             app_name: app_name.to_owned(),
             symbols,
             stubs,
@@ -1284,7 +1285,7 @@ impl InitPlan {
             env,
             preopens,
             entropy,
-        })
+        }
     }
 }
 

@@ -270,6 +270,7 @@ fn number<'py, T: for<'a> pyo3::FromPyObject<'a, 'py>>(
     path: &str,
 ) -> PyResult<()> {
     value.extract::<T>().map(drop).map_err(|error| {
+        let error: PyErr = error.into();
         if error.is_instance_of::<PyOverflowError>(value.py()) {
             PyOverflowError::new_err(format!(
                 "{path}: {} is out of range for {range}",

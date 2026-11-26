@@ -41,6 +41,8 @@ use {
     },
 };
 
+mod check;
+
 mod bindings {
     wit_bindgen::generate!({
         world: "init",
@@ -182,15 +184,22 @@ fn call_import<'a>(
     module: Bound<'a, PyModule>,
     index: u32,
     params: Vec<Bound<'a, PyAny>>,
-) -> Bound<'a, PyAny> {
+) -> PyResult<Bound<'a, PyAny>> {
     let py = module.py();
     let func = WIT
         .get()
         .unwrap()
         .import_func(usize::try_from(index).unwrap());
 
+    // Reject a value that does not match its WIT type before anything is
+    // lowered, so the host sees no call.
+    for (position, (ty, value)) in func.params().zip(&params).enumerate() {
+        let mut path = format!("argument {position} of `{}`", func.name());
+        check::check(py, ty, value, &mut path)?;
+    }
+
     let mut call = MyCall::new(params.into_iter().rev().map(|v| v.unbind()).collect());
-    if func.is_async() {
+    Ok(if func.is_async() {
         #[cfg(feature = "async")]
         {
             if let Some(pending) = unsafe { func.call_import_async(&mut call) } {
@@ -231,7 +240,20 @@ fn call_import<'a>(
         assert!(call.stack.len() < 2);
         call.stack.pop().unwrap_or(py.None())
     }
-    .into_bound(py)
+    .into_bound(py))
+}
+
+/// Traps with a diagnostic when an export's result does not match its WIT
+/// type. The handler already ran, so there is no Python caller to raise to.
+fn check_export_result(py: Python<'_>, func: ExportFunction, result: Option<&Py<PyAny>>) {
+    if let (Some(ty), Some(result)) = (func.result(), result) {
+        let mut path = format!("result of `{}`", func.name());
+        if let Err(error) = check::check(py, ty, result.bind(py), &mut path) {
+            let message = error.to_string();
+            error.print(py);
+            panic!("invalid export result: {message}")
+        }
+    }
 }
 
 #[pyo3::pyfunction]
@@ -502,6 +524,8 @@ mod async_ {
         if borrows != 0 {
             release_borrows(py, *unsafe { Box::from_raw(borrows as *mut Vec<Borrow>) });
         }
+
+        check_export_result(py, func, results.first());
 
         let mut call = MyCall::new(results);
         func.call_task_return(&mut call);
@@ -1313,6 +1337,8 @@ impl MyInterpreter {
                     }
                 };
 
+                check_export_result(py, func, result.as_ref());
+
                 if let Some(result) = result {
                     cx.stack.push(result);
                 }
@@ -1372,11 +1398,22 @@ impl Interpreter for MyInterpreter {
         }
     }
 
-    fn resource_dtor(ty: wit::Resource, handle: usize) {
-        // We don't currently include a `drop` function as part of the abstract
-        // base class we generate for an exported resource, so there's nothing
-        // to do here.  If/when that changes, we'll want to call `drop` here.
-        _ = (ty, handle);
+    fn resource_dtor(_ty: wit::Resource, handle: usize) {
+        // `exported_resource_to_canon` gave the handle table a strong reference
+        // to the Python object as its rep. The last handle is gone, so release
+        // that reference; the object is finalized once nothing else uses it.
+        Python::attach(|py| {
+            let value = unsafe { Bound::<PyAny>::from_owned_ptr(py, handle as _) };
+            let name = intern!(py, "__componentize_py_handle");
+            if value.hasattr(name).unwrap() {
+                value.delattr(name).unwrap();
+            }
+            value
+                .getattr(intern!(py, "finalizer"))
+                .unwrap()
+                .call_method0(intern!(py, "detach"))
+                .unwrap();
+        })
     }
 }
 
@@ -1968,20 +2005,12 @@ impl Call for MyCall<'_> {
     fn push_own(&mut self, ty: wit::Resource, handle: u32) {
         Python::attach(|py| {
             self.stack.push(if let Some(rep) = ty.rep() {
-                // exported resource type
+                // exported resource type: take the object back and drop the
+                // handle, whose destructor releases the handle table's
+                // reference to it.
                 let rep = unsafe { rep(handle) };
                 let value = unsafe { Bound::<PyAny>::from_borrowed_ptr(py, rep as _) };
-
-                value
-                    .delattr(intern!(py, "__componentize_py_handle"))
-                    .unwrap();
-
-                value
-                    .getattr(intern!(py, "finalizer"))
-                    .unwrap()
-                    .call_method0(intern!(py, "detach"))
-                    .unwrap();
-
+                unsafe { ty.drop()(handle) };
                 value.unbind()
             } else {
                 // imported resource type

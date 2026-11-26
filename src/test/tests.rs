@@ -1085,6 +1085,7 @@ fn componentize_app(
             output_path: &tempdir.join("app.wasm"),
             add_to_linker: None,
             stub_wasi: false,
+            stack_size: None,
             import_interface_names: &std::collections::HashMap::new(),
             export_interface_names: &std::collections::HashMap::new(),
             intersect_world: None,
@@ -1246,7 +1247,15 @@ fn filesystem() -> Result<()> {
 }
 
 #[test]
-fn trap_on_empty_resource() -> Result<()> {
+fn lower_numbers() -> Result<()> {
+    TESTER.test(|world, store, runtime| {
+        assert_eq!(40 + 2, runtime.block_on(world.call_lower_numbers(store))?);
+        Ok(())
+    })
+}
+
+#[test]
+fn reject_moved_resource() -> Result<()> {
     TESTER.test(|world, store, runtime| {
         runtime.block_on(async {
             let thing = store
@@ -1255,16 +1264,7 @@ fn trap_on_empty_resource() -> Result<()> {
                 .table
                 .push(ThingString("Ni Hao".to_string()))?;
 
-            let error = world
-                .call_trap_on_empty_resource(store, thing)
-                .await
-                .unwrap_err();
-
-            let expected = "unknown handle index 0";
-            assert!(
-                format!("{error:?}").contains(expected),
-                "expected error message to contain `{expected}`; got {error:?}"
-            );
+            world.call_reject_moved_resource(store, thing).await?;
 
             Ok(())
         })
@@ -1272,36 +1272,16 @@ fn trap_on_empty_resource() -> Result<()> {
 }
 
 #[test]
-fn trap_on_empty_future() -> Result<()> {
+fn reject_moved_future() -> Result<()> {
     TESTER.test(|world, store, runtime| {
-        runtime.block_on(async {
-            let error = world.call_trap_on_empty_future(store).await.unwrap_err();
-
-            let expected = "unknown handle index 0";
-            assert!(
-                format!("{error:?}").contains(expected),
-                "expected error message to contain `{expected}`; got {error:?}"
-            );
-
-            Ok(())
-        })
+        Ok(runtime.block_on(async { world.call_reject_moved_future(store).await })?)
     })
 }
 
 #[test]
-fn trap_on_empty_stream() -> Result<()> {
+fn reject_moved_stream() -> Result<()> {
     TESTER.test(|world, store, runtime| {
-        runtime.block_on(async {
-            let error = world.call_trap_on_empty_stream(store).await.unwrap_err();
-
-            let expected = "unknown handle index 0";
-            assert!(
-                format!("{error:?}").contains(expected),
-                "expected error message to contain `{expected}`; got {error:?}"
-            );
-
-            Ok(())
-        })
+        Ok(runtime.block_on(async { world.call_reject_moved_stream(store).await })?)
     })
 }
 

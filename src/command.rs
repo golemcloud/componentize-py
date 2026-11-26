@@ -205,6 +205,16 @@ pub struct Componentize {
     /// randomness is required.
     #[arg(short = 's', long)]
     pub stub_wasi: bool,
+
+    /// Size in bytes of the linear-memory stack used by C code.
+    ///
+    /// CPython raises `RecursionError` when this stack is nearly full.  The
+    /// Wasm runtime's own call stack is separate and is not visible to
+    /// CPython, so a smaller value makes deep C recursion raise
+    /// `RecursionError` before that call stack is exhausted.  Defaults to the
+    /// linker's 1 MiB.
+    #[arg(long)]
+    pub stack_size: Option<u32>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -322,6 +332,7 @@ fn componentize(common: Common, componentize: Componentize) -> Result<()> {
             output_path: &componentize.output,
             add_to_linker: None,
             stub_wasi: componentize.stub_wasi,
+            stack_size: componentize.stack_size,
             import_interface_names: &common
                 .import_interface_name
                 .iter()
@@ -587,6 +598,7 @@ class Bindings(bindings.WorldExports):
             module_worlds: vec![],
             output: out_dir.path().join("app.wasm"),
             stub_wasi: false,
+            stack_size: None,
             intersect_world: None,
         };
         componentize(common, componentize_opts)
@@ -704,6 +716,7 @@ world lib-world {
                 module_worlds: vec![],
                 output: dir.path().join("app.wasm"),
                 stub_wasi: false,
+                stack_size: None,
                 intersect_world: None,
             },
         )

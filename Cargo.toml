@@ -49,6 +49,8 @@ serde = { version = "1.0.213", features = ["derive"] }
 toml = "0.8.19"
 semver = "1.0.23"
 wit-bindgen-core = "0.61.0"
+sha2 = "0.10.9"
+filetime = "0.2.29"
 
 [dev-dependencies]
 assert_cmd = "2.0.16"
@@ -82,6 +84,8 @@ tar = "0.4.41"
 zstd = "0.13.2"
 componentize-py-test-generator = { path = "test-generator", version = "0.25.0" }
 flate2 = "1.1.1"
+hex = "0.4.3"
+sha2 = "0.10.9"
 wasmparser = "0.258.0"
 wasm-encoder = "0.258.0"
 
@@ -91,3 +95,11 @@ package.edition = "2024"
 package.license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
 package.repository = "https://github.com/bytecodealliance/componentize-py"
 members = ["runtime", "test-generator"]
+
+# wit-component 0.258.3 from the golem-2.0 branch of golemcloud/wasm-tools,
+# which adds one fix in `src/linking.rs`: the dlopen symbol table counts only
+# the symbols it writes, so a library exporting a Wasm tag (such as
+# `__c_longjmp`) no longer corrupts the table. Its sibling crates (wasmparser,
+# wasm-encoder, wit-parser, ...) still come from crates.io.
+[patch.crates-io]
+wit-component = { git = "https://github.com/golemcloud/wasm-tools", rev = "801650b5c9e5e4aa32451283f7a6d14100f92889" }

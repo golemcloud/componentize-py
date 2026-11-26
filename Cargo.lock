@@ -558,6 +558,7 @@ dependencies = [
  "clap",
  "component-init-transform",
  "componentize-py-test-generator",
+ "filetime",
  "flate2",
  "fs_extra",
  "futures",
@@ -573,6 +574,7 @@ dependencies = [
  "reqwest 0.12.28",
  "semver",
  "serde",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",
@@ -4820,8 +4822,7 @@ dependencies = [
 [[package]]
 name = "wit-component"
 version = "0.258.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0fca88950af0c1f42bc77e17315e48798b8d68340171b6d204f62bc19a878a6"
+source = "git+https://github.com/golemcloud/wasm-tools?rev=801650b5c9e5e4aa32451283f7a6d14100f92889#801650b5c9e5e4aa32451283f7a6d14100f92889"
 dependencies = [
  "anyhow",
  "bitflags",

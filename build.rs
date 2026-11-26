@@ -2,6 +2,7 @@
 
 use {
     anyhow::{Context, Result, anyhow, bail},
+    sha2::{Digest as _, Sha256},
     std::{
         env,
         fmt::Write as _,
@@ -22,9 +23,14 @@ const STRIP_RUNTIME: bool = !DEBUG_RUNTIME;
 const ZSTD_COMPRESSION_LEVEL: i32 = if DEBUG_RUNTIME { 0 } else { 19 };
 const DEFAULT_SDK_VERSION: &str = "34";
 
-// SQLite version to build - 3.51.2 (latest as of Jan 2026)
-const SQLITE_VERSION: &str = "3510200";
+const SQLITE_VERSION: &str = "3540100";
 const SQLITE_YEAR: &str = "2026";
+const SQLITE_TARBALL_SHA256: &str =
+    "926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e";
+
+const ZLIB_VERSION: &str = "1.3.2";
+const ZLIB_TARBALL_SHA256: &str =
+    "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16";
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const PYTHON_EXECUTABLE: &str = "python.exe";
@@ -36,10 +42,18 @@ const CLANG_EXECUTABLE: &str = "clang.exe";
 #[cfg(not(target_os = "windows"))]
 const CLANG_EXECUTABLE: &str = "clang";
 
-// TODO: switch to upstream release per
-// https://github.com/bytecodealliance/componentize-py/issues/215
-const CPYTHON_TARBALL_URL: &str = "https://github.com/dicej/cpython/tarball/v3.14.0-wasi-sdk-30";
-const CPYTHON_TARBALL_BASE_DIR: &str = "dicej-cpython-0e13686";
+// The CPython release tarball from python.org, plus the WASI patches in
+// `cpython-patches/` that are not part of this release.
+const CPYTHON_VERSION: &str = "3.14.10";
+const CPYTHON_TARBALL_SHA256: &str =
+    "9e4996c19ae5a3df31f10c37723661f71d3455d73bd005f79df7098e5cc13192";
+
+// The file in `cpython/` and in `cpython/builddir/wasi` that names the sources
+// the tree and the built library were made from. A tree or library with
+// another identity, or none, is rejected instead of being reused.
+// The name is not hidden, because CI uploads `cpython/builddir/wasi` as an
+// artifact without hidden files.
+const CPYTHON_SOURCE_IDENTITY_FILE: &str = "componentize-py-source-identity";
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -76,6 +90,7 @@ fn stubs_for_clippy(out_dir: &Path) -> Result<()> {
         "libwasi-emulated-signal.so.zst",
         "libc++.so.zst",
         "libc++abi.so.zst",
+        "libsetjmp.so.zst",
         "wasi_snapshot_preview1.reactor.wasm.zst",
     ];
 
@@ -154,7 +169,8 @@ fn find_wasi_sdk(out_dir: &Path) -> Result<PathBuf> {
         url,
         wasi_sdk.display()
     );
-    fetch_extract(&url, out_dir)?;
+    // The SDK source and version are configurable, so no digest is pinned for it.
+    fetch_extract(&url, None, out_dir)?;
 
     Ok(wasi_sdk)
 }
@@ -189,6 +205,7 @@ fn package_all_the_things(out_dir: &Path) -> Result<()> {
 
     let libraries = [
         "libc.so",
+        "libsetjmp.so",
         "libwasi-emulated-mman.so",
         "libwasi-emulated-process-clocks.so",
         "libwasi-emulated-getpid.so",
@@ -307,111 +324,204 @@ fn add(builder: &mut Builder<impl Write>, root: &Path, path: &Path) -> Result<()
 
 fn maybe_make_cpython(repo_dir: &Path, wasi_sdk: &Path) -> Result<()> {
     let cpython_dir = repo_dir.join("cpython");
-    if !cpython_dir.exists() {
-        let url = &env::var("CPYTHON_TARBALL_URL").unwrap_or_else(|_| CPYTHON_TARBALL_URL.into());
-        let base_dir = &env::var_os("CPYTHON_TARBALL_BASE_DIR")
-            .unwrap_or_else(|| CPYTHON_TARBALL_BASE_DIR.into());
-        println!("cargo:warning=downloading CPython source code from {url}");
-        fetch_extract(url, repo_dir)?;
-        fs::rename(repo_dir.join(base_dir), &cpython_dir)?;
-    }
+    let patch_dir = repo_dir.join("cpython-patches");
+    println!("cargo:rerun-if-changed={}", patch_dir.display());
+    let mut patches = fs::read_dir(&patch_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    patches.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "patch")
+    });
+    patches.sort();
+    let identity = cpython_source_identity(&patches)?;
 
     let cpython_wasi_dir = cpython_dir.join("builddir/wasi");
-    if !cpython_wasi_dir.join("libpython3.14.so").exists() {
-        fs::create_dir_all(&cpython_wasi_dir)?;
-        if !cpython_wasi_dir.join("libpython3.14.a").exists() {
-            let cpython_native_dir = repo_dir.join("cpython/builddir/build");
-            if !cpython_native_dir.join(PYTHON_EXECUTABLE).exists() {
-                fs::create_dir_all(&cpython_native_dir)?;
-
-                run(Command::new("../../configure")
-                    .current_dir(&cpython_native_dir)
-                    .arg(format!(
-                        "--prefix={}/install",
-                        cpython_native_dir.to_str().ok_or_else(|| anyhow!(
-                            "non-UTF8 path: {}",
-                            cpython_native_dir.display()
-                        ))?
-                    )))?;
-
-                run(Command::new("make").current_dir(cpython_native_dir))?;
-            }
-
-            let lib_install_dir = cpython_wasi_dir.join("deps");
-            build_zlib(wasi_sdk, &lib_install_dir)?;
-
-            build_sqlite(wasi_sdk, &lib_install_dir)?;
-
-            let config_guess =
-                run(Command::new("../../config.guess").current_dir(&cpython_wasi_dir))?;
-
-            let dir = cpython_wasi_dir
-                .to_str()
-                .ok_or_else(|| anyhow!("non-UTF8 path: {}", cpython_wasi_dir.display()))?;
-
-            // Configure CPython with SQLite support
-            // The CFLAGS and LDFLAGS now include paths to both zlib AND sqlite
-            run(Command::new("../../Tools/wasm/wasi-env")
-                .env(
-                    "CONFIG_SITE",
-                    "../../Tools/wasm/wasi/config.site-wasm32-wasi",
-                )
-                .env(
-                    "CFLAGS",
-                    format!("--target=wasm32-wasip2 -fPIC -I{dir}/deps/include"),
-                )
-                .env("WASI_SDK_PATH", wasi_sdk)
-                .env(
-                    "LDFLAGS",
-                    format!("--target=wasm32-wasip2 -L{dir}/deps/lib"),
-                )
-                .current_dir(&cpython_wasi_dir)
-                .args([
-                    "../../configure",
-                    "-C",
-                    "--host=wasm32-unknown-wasip2",
-                    &format!("--build={}", String::from_utf8(config_guess)?),
-                    &format!("--with-build-python={dir}/../build/{PYTHON_EXECUTABLE}",),
-                    &format!("--prefix={dir}/install"),
-                    "--disable-test-modules",
-                    "--enable-ipv6",
-                ]))?;
-
-            // Write Modules/Setup.local to force-enable _sqlite3
-            // This ensures the module is built even if configure doesn't auto-detect it
-            write_setup_local(&cpython_wasi_dir)?;
-
-            run(Command::new("make")
-                .current_dir(&cpython_wasi_dir)
-                .args(["build_all", "install"]))?;
-        }
-
-        // Link libpython3.14.so - now includes libsqlite3.a
-        run(Command::new(wasi_sdk.join("bin/clang"))
-            .arg("--target=wasm32-wasip2")
-            .arg("-shared")
-            .arg("-o")
-            .arg(cpython_wasi_dir.join("libpython3.14.so"))
-            .arg("-Wl,--whole-archive")
-            .arg(cpython_wasi_dir.join("libpython3.14.a"))
-            .arg("-Wl,--no-whole-archive")
-            .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_HMAC.a"))
-            .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_BLAKE2.a"))
-            .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_MD5.a"))
-            .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_SHA1.a"))
-            .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_SHA2.a"))
-            .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_SHA3.a"))
-            .arg(cpython_wasi_dir.join("Modules/_decimal/libmpdec/libmpdec.a"))
-            .arg(cpython_wasi_dir.join("Modules/expat/libexpat.a"))
-            .arg(cpython_wasi_dir.join("deps/lib/libz.a"))
-            .arg(cpython_wasi_dir.join("deps/lib/libsqlite3.a"))
-            .arg("-lwasi-emulated-signal")
-            .arg("-lwasi-emulated-getpid")
-            .arg("-lwasi-emulated-process-clocks")
-            .arg("-ldl"))?;
+    if cpython_wasi_dir.join("libpython3.14.so").exists() {
+        // A build restored without its sources, as in CI, carries the
+        // identity next to the library.
+        return check_cpython_identity(&cpython_wasi_dir, &identity, &cpython_dir, &patch_dir);
     }
 
+    if cpython_dir.exists() {
+        check_cpython_identity(&cpython_dir, &identity, &cpython_dir, &patch_dir)?;
+    } else {
+        let url = format!(
+            "https://www.python.org/ftp/python/{CPYTHON_VERSION}/Python-{CPYTHON_VERSION}.tgz"
+        );
+        println!("cargo:warning=downloading CPython source code from {url}");
+        // An interrupted build can leave a partly patched tree behind, which
+        // the patches would not apply to again.
+        let source_dir = repo_dir.join(format!("Python-{CPYTHON_VERSION}"));
+        if source_dir.exists() {
+            fs::remove_dir_all(&source_dir)?;
+        }
+        fetch_extract(&url, Some(CPYTHON_TARBALL_SHA256), repo_dir)?;
+
+        for patch in &patches {
+            run(Command::new("patch")
+                .current_dir(&source_dir)
+                .arg("--batch")
+                .arg("--forward")
+                .arg("-p1")
+                .arg("-i")
+                .arg(patch))?;
+        }
+
+        fs::write(source_dir.join(CPYTHON_SOURCE_IDENTITY_FILE), &identity)?;
+        fs::rename(source_dir, &cpython_dir)?;
+    }
+
+    fs::create_dir_all(&cpython_wasi_dir)?;
+    if !cpython_wasi_dir.join("libpython3.14.a").exists() {
+        let cpython_native_dir = repo_dir.join("cpython/builddir/build");
+        if !cpython_native_dir.join(PYTHON_EXECUTABLE).exists() {
+            fs::create_dir_all(&cpython_native_dir)?;
+
+            run(Command::new("../../configure")
+                .current_dir(&cpython_native_dir)
+                .arg(format!(
+                    "--prefix={}/install",
+                    cpython_native_dir.to_str().ok_or_else(|| anyhow!(
+                        "non-UTF8 path: {}",
+                        cpython_native_dir.display()
+                    ))?
+                )))?;
+
+            run(Command::new("make").current_dir(cpython_native_dir))?;
+        }
+
+        let lib_install_dir = cpython_wasi_dir.join("deps");
+        build_zlib(wasi_sdk, &lib_install_dir)?;
+
+        build_sqlite(wasi_sdk, &lib_install_dir)?;
+
+        let config_guess = run(Command::new("../../config.guess").current_dir(&cpython_wasi_dir))?;
+
+        let dir = cpython_wasi_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF8 path: {}", cpython_wasi_dir.display()))?;
+
+        // Configure CPython with SQLite support
+        // The CFLAGS and LDFLAGS now include paths to both zlib AND sqlite
+        run(Command::new("../../Tools/wasm/wasi-env")
+            .env(
+                "CONFIG_SITE",
+                "../../Tools/wasm/wasi/config.site-wasm32-wasi",
+            )
+            .env(
+                "CFLAGS",
+                format!("--target=wasm32-wasip2 -fPIC -I{dir}/deps/include"),
+            )
+            .env("WASI_SDK_PATH", wasi_sdk)
+            .env(
+                "LDFLAGS",
+                format!("--target=wasm32-wasip2 -L{dir}/deps/lib"),
+            )
+            .current_dir(&cpython_wasi_dir)
+            .args([
+                "../../configure",
+                "-C",
+                "--host=wasm32-unknown-wasip2",
+                &format!("--build={}", String::from_utf8(config_guess)?),
+                &format!("--with-build-python={dir}/../build/{PYTHON_EXECUTABLE}",),
+                &format!("--prefix={dir}/install"),
+                "--disable-test-modules",
+                "--enable-ipv6",
+            ]))?;
+
+        // Write Modules/Setup.local to force-enable _sqlite3
+        // This ensures the module is built even if configure doesn't auto-detect it
+        write_setup_local(&cpython_wasi_dir)?;
+
+        run(Command::new("make")
+            .current_dir(&cpython_wasi_dir)
+            .args(["build_all", "install"]))?;
+    }
+
+    // Link libpython3.14.so - now includes libsqlite3.a
+    run(Command::new(wasi_sdk.join("bin/clang"))
+        .arg("--target=wasm32-wasip2")
+        .arg("-shared")
+        .arg("-o")
+        .arg(cpython_wasi_dir.join("libpython3.14.so"))
+        .arg("-Wl,--whole-archive")
+        .arg(cpython_wasi_dir.join("libpython3.14.a"))
+        .arg("-Wl,--no-whole-archive")
+        .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_HMAC.a"))
+        .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_BLAKE2.a"))
+        .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_MD5.a"))
+        .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_SHA1.a"))
+        .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_SHA2.a"))
+        .arg(cpython_wasi_dir.join("Modules/_hacl/libHacl_Hash_SHA3.a"))
+        .arg(cpython_wasi_dir.join("Modules/_decimal/libmpdec/libmpdec.a"))
+        .arg(cpython_wasi_dir.join("Modules/expat/libexpat.a"))
+        .arg(cpython_wasi_dir.join("deps/lib/libz.a"))
+        .arg(cpython_wasi_dir.join("deps/lib/libsqlite3.a"))
+        .arg("-lwasi-emulated-signal")
+        .arg("-lwasi-emulated-getpid")
+        .arg("-lwasi-emulated-process-clocks")
+        .arg("-ldl"))?;
+
+    fs::write(
+        cpython_wasi_dir.join(CPYTHON_SOURCE_IDENTITY_FILE),
+        &identity,
+    )?;
     Ok(())
+}
+
+/// Fails unless `dir` names the CPython sources that `identity` describes.
+fn check_cpython_identity(
+    dir: &Path,
+    identity: &str,
+    cpython_dir: &Path,
+    patch_dir: &Path,
+) -> Result<()> {
+    let found = fs::read_to_string(dir.join(CPYTHON_SOURCE_IDENTITY_FILE)).ok();
+    let found = found.as_deref().map(str::trim);
+    if found != Some(identity) {
+        bail!(
+            "{} was not made from CPython {CPYTHON_VERSION} with the patches in {} \
+             (source identity {}, expected {identity}); delete {} to download, patch and \
+             build CPython again",
+            dir.display(),
+            patch_dir.display(),
+            found.unwrap_or("missing"),
+            cpython_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Returns the SHA-256 of the sources that go into `cpython/`: the CPython
+/// tarball, the name and content of each patch in order, and the zlib and
+/// SQLite tarballs that are built into `libpython3.14.so`.
+fn cpython_source_identity(patches: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for part in [
+        CPYTHON_VERSION,
+        CPYTHON_TARBALL_SHA256,
+        ZLIB_VERSION,
+        ZLIB_TARBALL_SHA256,
+        SQLITE_VERSION,
+        SQLITE_TARBALL_SHA256,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    for patch in patches {
+        let name = patch
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("non-UTF8 path: {}", patch.display()))?;
+        // Git may check the patches out with CRLF line endings on Windows.
+        let content = String::from_utf8(fs::read(patch)?)?.replace("\r\n", "\n");
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update((content.len() as u64).to_le_bytes());
+        hasher.update(&content);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Write Modules/Setup.local to enable _sqlite3 module
@@ -575,9 +685,15 @@ fn make_runtime(
     Ok(())
 }
 
-fn fetch_extract(url: &str, out_dir: &Path) -> Result<()> {
-    let response = reqwest::blocking::get(url)?;
-    let decoder = flate2::read::GzDecoder::new(response);
+fn fetch_extract(url: &str, sha256: Option<&str>, out_dir: &Path) -> Result<()> {
+    let bytes = reqwest::blocking::get(url)?.error_for_status()?.bytes()?;
+    if let Some(expected) = sha256 {
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != expected {
+            bail!("{url} has SHA-256 {actual}, expected {expected}");
+        }
+    }
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(out_dir)?;
     Ok(())
@@ -603,10 +719,13 @@ fn add_compile_envs(wasi_sdk: &Path, command: &mut Command) {
 fn build_zlib(wasi_sdk: &Path, install_dir: &Path) -> Result<()> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     fetch_extract(
-        "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+        &format!(
+            "https://github.com/madler/zlib/releases/download/v{ZLIB_VERSION}/zlib-{ZLIB_VERSION}.tar.gz"
+        ),
+        Some(ZLIB_TARBALL_SHA256),
         &out_dir,
     )?;
-    let src_dir = out_dir.join("zlib-1.3.1");
+    let src_dir = out_dir.join(format!("zlib-{ZLIB_VERSION}"));
 
     let prefix = install_dir
         .to_str()
@@ -663,7 +782,7 @@ fn build_sqlite(wasi_sdk: &Path, install_dir: &Path) -> Result<()> {
 
     // Download SQLite amalgamation
     let url = format!("https://sqlite.org/{SQLITE_YEAR}/sqlite-autoconf-{SQLITE_VERSION}.tar.gz");
-    fetch_extract(&url, &out_dir)?;
+    fetch_extract(&url, Some(SQLITE_TARBALL_SHA256), &out_dir)?;
 
     let src_dir = out_dir.join(format!("sqlite-autoconf-{SQLITE_VERSION}"));
 

@@ -4722,6 +4722,7 @@ dependencies = [
 [[package]]
 name = "wit-component"
 version = "0.258.3"
+source = "git+https://github.com/golemcloud/wasm-tools?rev=801650b5c9e5e4aa32451283f7a6d14100f92889#801650b5c9e5e4aa32451283f7a6d14100f92889"
 dependencies = [
  "anyhow",
  "bitflags",

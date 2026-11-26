@@ -122,10 +122,11 @@ package.edition = "2024"
 package.license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
 package.repository = "https://github.com/bytecodealliance/componentize-py"
 members = ["runtime", "test-generator"]
-exclude = ["vendor/wit-component"]
 
-# wit-component 0.258.3 from crates.io with one fix in `src/linking.rs`: the
-# dlopen symbol table counts only the symbols it writes, so a library exporting
-# a Wasm tag (such as `__c_longjmp`) no longer corrupts the table.
+# wit-component 0.258.3 from the golem-2.0 branch of golemcloud/wasm-tools,
+# which adds one fix in `src/linking.rs`: the dlopen symbol table counts only
+# the symbols it writes, so a library exporting a Wasm tag (such as
+# `__c_longjmp`) no longer corrupts the table. Its sibling crates (wasmparser,
+# wasm-encoder, wit-parser, ...) still come from crates.io.
 [patch.crates-io]
-wit-component = { path = "vendor/wit-component" }
+wit-component = { git = "https://github.com/golemcloud/wasm-tools", rev = "801650b5c9e5e4aa32451283f7a6d14100f92889" }

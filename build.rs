@@ -64,6 +64,13 @@ fn main() -> Result<()> {
         || env::var("CLIPPY_ARGS").is_ok()
         || env::var("CARGO_EXPAND_NO_RUN_NIGHTLY").is_ok()
     {
+        println!(
+            "cargo:warning=using stubbed runtime, core library, and adapter for static analysis purposes..."
+        );
+        stubs_for_clippy(&out_dir)
+    } else if env::var_os("CARGO_FEATURE_EMBEDDED_RUNTIME").is_none() {
+        // Without the embedded runtime, the crate only reads and assembles
+        // prepared assets, which carry their own runtime.
         stubs_for_clippy(&out_dir)
     } else {
         package_all_the_things(&out_dir)
@@ -75,10 +82,6 @@ fn main() -> Result<()> {
 }
 
 fn stubs_for_clippy(out_dir: &Path) -> Result<()> {
-    println!(
-        "cargo:warning=using stubbed runtime, core library, and adapter for static analysis purposes..."
-    );
-
     let files = [
         "libcomponentize_py_runtime_sync.so.zst",
         "libcomponentize_py_runtime_async.so.zst",

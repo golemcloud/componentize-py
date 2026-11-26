@@ -1,13 +1,15 @@
 #![deny(warnings)]
+// Without the embedded runtime the crate only reads and assembles prepared
+// assets, so the code that prepares them is unused.
+#![cfg_attr(not(feature = "embedded-runtime"), allow(dead_code, unused_imports))]
 
 use {
     anyhow::{Context, Error, Result, anyhow, bail, ensure},
     async_trait::async_trait,
     bytes::Bytes,
-    component_init_transform::Invoker,
     futures::future::FutureExt,
     indexmap::{IndexMap, IndexSet},
-    serde::Deserialize,
+    serde::{Deserialize, Serialize},
     sha2::{Digest as _, Sha256},
     std::{
         borrow::Cow,
@@ -19,36 +21,48 @@ use {
         path::{Path, PathBuf},
         str,
     },
-    summary::{Locations, Summary},
     tar::Archive,
-    wasm_encoder::{CustomSection, Section as _},
     wasmtime::{
         Config, Engine, Store,
         component::{Component, Instance, Linker, ResourceTable, ResourceType},
     },
-    wasmtime_wasi::{
-        Deterministic, FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
-        p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-    },
+    zstd::Decoder,
+};
+
+#[cfg(feature = "embedded-runtime")]
+use {
+    summary::{Locations, Summary},
+    wasm_encoder::{CustomSection, Section as _},
     wit_component::metadata,
     wit_dylib::DylibOpts,
     wit_parser::{
         CloneMaps, FunctionKind, Package, PackageId, PackageName, Resolve, Stability, TypeDefKind,
         World, WorldId, WorldItem, WorldKey,
     },
-    zstd::Decoder,
 };
 
+#[cfg(feature = "embedded-runtime")]
+use wasmtime_wasi::{
+    Deterministic, FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
+};
+
+#[cfg(feature = "embedded-runtime")]
 pub mod command;
 mod link;
 mod prelink;
-#[cfg(feature = "pyo3")]
+pub mod prepared;
+#[cfg(all(feature = "pyo3", feature = "embedded-runtime"))]
 mod python;
+#[cfg(feature = "embedded-runtime")]
 mod registry;
+#[cfg(feature = "embedded-runtime")]
 mod stubwasi;
+#[cfg(feature = "embedded-runtime")]
 mod summary;
-#[cfg(test)]
+#[cfg(all(test, feature = "embedded-runtime"))]
 mod test;
+#[cfg(feature = "embedded-runtime")]
 mod util;
 
 const DEBUG_PYTHON_BINDINGS: bool = false;
@@ -60,13 +74,18 @@ wasmtime::component::bindgen!({
     path: "wit",
     world: "init",
     exports: { default: async },
+    additional_derives: [serde::Serialize, serde::Deserialize],
 });
 
+pub use {component_init_transform::Invoker, exports::exports::Symbols};
+
+#[cfg(feature = "embedded-runtime")]
 pub struct Ctx {
     wasi: WasiCtx,
     table: ResourceTable,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl WasiView for Ctx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -80,15 +99,18 @@ impl WasiView for Ctx {
 /// advances one microsecond each time it is read, so nothing the application
 /// saves depends on when it was built, and code waiting for time to pass still
 /// finishes.
+#[cfg(feature = "embedded-runtime")]
 #[derive(Default)]
 struct BuildClock(std::sync::atomic::AtomicU64);
 
+#[cfg(feature = "embedded-runtime")]
 impl BuildClock {
     fn tick(&self) -> u64 {
         self.0.fetch_add(1000, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl wasmtime_wasi::HostWallClock for BuildClock {
     fn resolution(&self) -> std::time::Duration {
         std::time::Duration::from_micros(1)
@@ -99,6 +121,7 @@ impl wasmtime_wasi::HostWallClock for BuildClock {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl wasmtime_wasi::HostMonotonicClock for BuildClock {
     fn resolution(&self) -> u64 {
         1000
@@ -119,9 +142,13 @@ fn set_build_mtimes(path: &Path) -> Result<()> {
     }
     // `FileTime::zero` is the platform epoch, which Windows cannot set.
     let epoch = filetime::FileTime::from_unix_time(0, 0);
+    // Newer `filetime` releases deprecate this in favor of `std::fs::set_times`,
+    // which does not set the times of directories on every platform.
+    #[allow(deprecated)]
     filetime::set_file_times(path, epoch, epoch).with_context(|| path.display().to_string())
 }
 
+#[derive(Clone)]
 pub struct Library {
     name: String,
     module: Vec<u8>,
@@ -179,13 +206,13 @@ pub struct ConfigContext<T> {
     config: T,
 }
 
-struct MyInvoker {
-    store: Store<Ctx>,
+struct MyInvoker<T: 'static> {
+    store: Store<T>,
     instance: Instance,
 }
 
 #[async_trait]
-impl Invoker for MyInvoker {
+impl<T: Send + 'static> Invoker for MyInvoker<T> {
     async fn call_s32(&mut self, function: &str) -> Result<i32> {
         let func = self
             .instance
@@ -222,6 +249,7 @@ impl Invoker for MyInvoker {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 pub struct BindingsGenerator<'a> {
     pub wit_paths: &'a [&'a Path],
     pub worlds: &'a [&'a str],
@@ -237,6 +265,7 @@ pub struct BindingsGenerator<'a> {
     pub allow_existing: bool,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl BindingsGenerator<'_> {
     pub async fn generate(&self) -> Result<()> {
         // Here we parse the specified WIT paths and resolve the specified
@@ -364,6 +393,7 @@ pub(crate) fn warn_full_names_deprecated(full_names: Option<bool>, source: Optio
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Resolve the deprecated `world_module` spelling of `bindings_module`, warning
 /// about it and about `full_names`.
 pub(crate) fn resolve_deprecated(
@@ -386,6 +416,7 @@ pub(crate) fn resolve_deprecated(
     Ok(bindings_module.or(world_module))
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Reject `--bindings-module` values which are not importable Python paths.
 fn validate_bindings_module(module: &str) -> Result<()> {
     if module
@@ -398,6 +429,7 @@ fn validate_bindings_module(module: &str) -> Result<()> {
     }
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Make each ancestor of a dotted bindings module a regular package.
 fn create_module_ancestors(root: &Path, module: &str) -> Result<()> {
     let components = module.split('.').collect::<Vec<_>>();
@@ -414,6 +446,7 @@ fn create_module_ancestors(root: &Path, module: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "embedded-runtime")]
 /// Replace each helper placeholder with the module path generated for it; an
 /// unimported interface has no entry and keeps its placeholder.
 fn resolve_helper_placeholders(path: &Path, replacements: &[(&str, String)]) -> Result<()> {
@@ -443,8 +476,10 @@ fn resolve_helper_placeholders(path: &Path, replacements: &[(&str, String)]) -> 
     Ok(())
 }
 
+#[cfg(feature = "embedded-runtime")]
 pub type AddToLinker<'a> = Option<&'a dyn Fn(&mut Linker<Ctx>) -> Result<()>>;
 
+#[cfg(feature = "embedded-runtime")]
 pub struct ComponentGenerator<'a> {
     pub wit_paths: &'a [&'a Path],
     pub worlds: &'a [&'a str],
@@ -467,8 +502,92 @@ pub struct ComponentGenerator<'a> {
     pub default_registries: bool,
 }
 
+#[cfg(feature = "embedded-runtime")]
 impl ComponentGenerator<'_> {
     pub async fn generate(&self) -> Result<()> {
+        let bound = self.bind().await?;
+
+        let component = link::link_libraries(
+            &bound.libraries,
+            &prelink::embedded_adapter()?,
+            self.stack_size,
+        )?;
+
+        let stubbed_component = if self.stub_wasi {
+            stubwasi::link_stub_modules(bound.libraries)?
+        } else {
+            None
+        };
+
+        let mut preopens = vec![
+            Preopen::new(bound.standard_library.path(), "python"),
+            Preopen::new(bound.helper_utils.path(), "bundled"),
+        ];
+        let mut python_path = Vec::new();
+        for (index, path) in bound.python_path.iter().enumerate() {
+            preopens.push(Preopen::new(Path::new(path), &index.to_string()));
+            python_path.push(format!("/{index}"));
+        }
+        for (mounts, world_dir) in &bound.world_dir_mounts {
+            for mount in mounts {
+                if DEBUG_PYTHON_BINDINGS {
+                    eprintln!(
+                        "world dir path: {}; mount: {mount}",
+                        world_dir.path().display()
+                    );
+                }
+                preopens.push(Preopen::new(world_dir.path(), mount));
+            }
+        }
+
+        let plan = InitPlan::new(
+            self.app_name,
+            bound.symbols,
+            bound.stubs,
+            self.stub_wasi,
+            preopens,
+            &python_path,
+            BuildEntropy::for_inputs(
+                &component,
+                self.app_name,
+                &bound.python_path.iter().map(Path::new).collect::<Vec<_>>(),
+            )?,
+        );
+
+        let component = initialize(
+            &component,
+            stubbed_component
+                .as_ref()
+                .map(|(component, map)| (component.deref(), map as &dyn Fn(u32) -> u32)),
+            &plan,
+            &default_engine()?,
+            self.add_to_linker,
+        )
+        .await?;
+
+        if DEBUG_PYTHON_BINDINGS {
+            // Prevent temporary directories from being deleted:
+            std::mem::forget(bound.world_dir_mounts);
+        }
+
+        // Checks if the output directory exists, and creates it if it doesn't.
+        if let Some(parent) = self.output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(self.output_path, component)?;
+
+        Ok(())
+    }
+
+    /// Resolves the WIT inputs, generates the Wasm and Python bindings, and
+    /// collects the libraries to link, without linking or initializing.
+    async fn bind(&self) -> Result<Bound> {
+        ensure!(
+            cfg!(feature = "embedded-runtime"),
+            "componentize-py was built without the `embedded-runtime` feature, so it can \
+             only assemble prepared assets"
+        );
+
         // This is a _big_ function.  Here's an overview of what it does.
         //
         // Our goal here is to collect one or more WIT paths, parse them, and
@@ -866,70 +985,6 @@ impl ComponentGenerator<'_> {
             dl_openable: false,
         });
 
-        let component = link::link_libraries(&libraries, self.stack_size)?;
-
-        let stubbed_component = if self.stub_wasi {
-            stubwasi::link_stub_modules(libraries)?
-        } else {
-            None
-        };
-
-        // Pre-initialize the component by running it through
-        // `component_init_transform::initialize`.  Currently, this is the
-        // application's first and only chance to load any standard or third-party
-        // modules since we do not yet include a virtual filesystem in the component
-        // to make those modules available at runtime.
-
-        let stdout = MemoryOutputPipe::new(10000);
-        let stderr = MemoryOutputPipe::new(10000);
-
-        // Pre-initialization saves everything the application computes into
-        // the component, so derive its hash seed and random bytes from the
-        // linked component and the application's sources instead of from host
-        // entropy.  Identical inputs then produce identical components, and
-        // applications that share the same libraries still get different
-        // values.  The runtime reseeds `random` from the host before the first
-        // export call.
-        let digest = build_digest(&component, self.app_name, python_path)?;
-        let random_bytes = (0u32..1024)
-            .flat_map(|counter| {
-                Sha256::new()
-                    .chain_update(digest)
-                    .chain_update(counter.to_le_bytes())
-                    .finalize()
-            })
-            .collect::<Vec<_>>();
-
-        let mut wasi = WasiCtxBuilder::new();
-        wasi.secure_random(Deterministic::new(random_bytes.clone()))
-            .insecure_random(Deterministic::new(random_bytes))
-            .insecure_random_seed(u128::from_le_bytes(digest[..16].try_into().unwrap()))
-            .env(
-                "PYTHONHASHSEED",
-                u32::from_le_bytes(digest[..4].try_into().unwrap()).to_string(),
-            )
-            .wall_clock(BuildClock::default())
-            .monotonic_clock(BuildClock::default())
-            // Writing bytecode would change the source directories during the
-            // build and record the time of the write.
-            .env("PYTHONDONTWRITEBYTECODE", "1");
-        wasi.stdin(MemoryInputPipe::new(Bytes::new()))
-            .stdout(stdout.clone())
-            .stderr(stderr.clone())
-            .env("PYTHONUNBUFFERED", "1")
-            .env("PYTHONHOME", "/python")
-            .preopened_dir(
-                embedded_python_standard_lib.path(),
-                "python",
-                FsPerms::ReadWrite,
-            )?
-            .preopened_dir(embedded_helper_utils.path(), "bundled", FsPerms::ReadWrite)?;
-
-        // Generate guest mounts for each host directory in `python_path`.
-        for (index, path) in python_path.iter().enumerate() {
-            wasi.preopened_dir(path, index.to_string(), FsPerms::ReadWrite)?;
-        }
-
         // For each Python module with a `componentize-py.toml` file that
         // specifies where generated bindings for that package should be placed,
         // generate the bindings and place them as indicated.
@@ -1001,18 +1056,6 @@ impl ComponentGenerator<'_> {
             &summary.helper_module_paths(&locations),
         )?;
 
-        for (mounts, world_dir) in world_dir_mounts.iter() {
-            for mount in mounts {
-                if DEBUG_PYTHON_BINDINGS {
-                    eprintln!(
-                        "world dir path: {}; mount: {mount}",
-                        world_dir.path().display()
-                    );
-                }
-                wasi.preopened_dir(world_dir.path(), mount, FsPerms::ReadWrite)?;
-            }
-        }
-
         // The guest's import system records directory modification times, so
         // give the directories created for this build a fixed time.
         for dir in [
@@ -1025,77 +1068,333 @@ impl ComponentGenerator<'_> {
             set_build_mtimes(dir)?;
         }
 
-        if DEBUG_PYTHON_BINDINGS {
-            // Prevent temporary directories from being deleted:
-            std::mem::forget(world_dir_mounts);
-        }
-
         // Generate a `Symbols` object containing metadata to be passed to the
         // pre-init function.  The runtime library will use this to look up types
         // and functions that will later be referenced by the generated Wasm code.
         let symbols = summary.collect_symbols(&locations, &metadata, &clone_maps);
 
-        // Finally, pre-initialize the component, writing the result to
-        // `self.output_path`.
+        Ok(Bound {
+            python_path: python_path.iter().map(|&path| path.to_owned()).collect(),
+            standard_library: embedded_python_standard_lib,
+            helper_utils: embedded_helper_utils,
+            world_dir_mounts,
+            libraries,
+            symbols,
+            stubs: import_stubs(&resolve, &all_worlds),
+        })
+    }
+}
 
-        let python_path = (0..python_path.len())
-            .map(|index| format!("/{index}"))
-            .collect::<Vec<_>>()
-            .join(":");
+#[cfg(feature = "embedded-runtime")]
+/// The owned result of processing the WIT inputs for one build.
+struct Bound {
+    python_path: Vec<String>,
+    standard_library: tempfile::TempDir,
+    helper_utils: tempfile::TempDir,
+    world_dir_mounts: Vec<(Vec<String>, tempfile::TempDir)>,
+    libraries: Vec<Library>,
+    symbols: Symbols,
+    stubs: Vec<ImportStub>,
+}
 
-        let table = ResourceTable::new();
-        let wasi = wasi
-            .env(
-                "PYTHONPATH",
-                format!("/python:/world:{python_path}:/bundled"),
-            )
-            .build();
+/// An import of the target world that pre-initialization satisfies with a
+/// trapping stub.  Imports of WASIp2 CLI interfaces are not stubbed; the
+/// initializer supplies them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportStub {
+    /// The interface name, or `None` for a world-level import.
+    pub interface: Option<String>,
+    pub name: String,
+    pub kind: ImportStubKind,
+}
 
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.wasm_component_model_async(true);
-        config.wasm_component_model_map(true);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportStubKind {
+    Function { is_async: bool },
+    Resource,
+}
 
-        let engine = Engine::new(&config)?;
+#[cfg(feature = "embedded-runtime")]
+fn import_stubs(resolve: &Resolve, worlds: &IndexSet<WorldId>) -> Vec<ImportStub> {
+    let function = |interface: Option<&String>, name: &String, kind: &FunctionKind| ImportStub {
+        interface: interface.cloned(),
+        name: name.clone(),
+        kind: ImportStubKind::Function {
+            is_async: kind.is_async(),
+        },
+    };
+    let resource = |interface: Option<&String>, name: &str| ImportStub {
+        interface: interface.cloned(),
+        name: name.to_owned(),
+        kind: ImportStubKind::Resource,
+    };
 
-        let mut linker = Linker::new(&engine);
-        let added_to_linker = if let Some(add_to_linker) = self.add_to_linker {
-            add_to_linker(&mut linker)?;
-            true
-        } else {
-            false
-        };
-
-        let mut store = Store::new(&engine, Ctx { wasi, table });
-
-        let stub_wasi = self.stub_wasi;
-        let app_name = self.app_name.to_owned();
-        let component = component_init_transform::initialize_staged(
-            &component,
-            stubbed_component
-                .as_ref()
-                .map(|(component, map)| (component.deref(), map as &dyn Fn(u32) -> u32)),
-            move |instrumented| {
-                async move {
-                    let component = &Component::new(&engine, instrumented)?;
-                    if !added_to_linker {
-                        add_wasi_and_stubs(&resolve, &all_worlds, &mut linker)?;
+    let mut stubs = Vec::new();
+    for &world in worlds {
+        for (key, item) in &resolve.worlds[world].imports {
+            match item {
+                WorldItem::Interface { id, .. } => {
+                    let interface_name = match key {
+                        WorldKey::Name(name) => name.clone(),
+                        WorldKey::Interface(interface) => resolve.id_of(*interface).unwrap(),
+                    };
+                    if is_wasip2_cli(&interface_name) {
+                        continue;
                     }
 
-                    let pre = InitPre::new(linker.instantiate_pre(component)?)?;
-                    let instance = pre.instance_pre.instantiate_async(&mut store).await?;
-                    let guest = pre.indices.interface0.load(&mut store, &instance)?;
+                    let interface = &resolve.interfaces[*id];
+                    for (function_name, f) in &interface.functions {
+                        stubs.push(function(Some(&interface_name), function_name, &f.kind));
+                    }
 
-                    guest
-                        .call_init(&mut store, &app_name, &symbols, stub_wasi)
-                        .await?
-                        .map_err(|e| anyhow!("{e}"))?;
-
-                    Ok(Box::new(MyInvoker { store, instance }) as Box<dyn Invoker>)
+                    for (type_name, id) in interface.types.iter() {
+                        if let TypeDefKind::Resource = &resolve.types[*id].kind {
+                            stubs.push(resource(Some(&interface_name), type_name));
+                        }
+                    }
                 }
-                .boxed()
-            },
-        )
+                WorldItem::Function(f) => stubs.push(function(None, &f.name, &f.kind)),
+                WorldItem::Type { id, .. } => {
+                    let ty = &resolve.types[*id];
+                    if let TypeDefKind::Resource = &ty.kind {
+                        stubs.push(resource(None, ty.name.as_ref().unwrap()));
+                    }
+                }
+            }
+        }
+    }
+    stubs
+}
+
+/// A host directory that pre-initialization makes visible to the guest.
+#[derive(Clone, Debug)]
+pub struct Preopen {
+    pub host: PathBuf,
+    /// The guest path, without a leading `/`.
+    pub guest: String,
+}
+
+impl Preopen {
+    fn new(host: &Path, guest: &str) -> Self {
+        Self {
+            host: host.to_owned(),
+            guest: guest.to_owned(),
+        }
+    }
+}
+
+/// Entropy for pre-initialization, derived from the build inputs so that
+/// identical inputs produce identical output.
+///
+/// Pre-initialization saves everything the application computes into the
+/// component, so it must not read host entropy.  The runtime reseeds `random`
+/// from the host before the first export call.
+#[derive(Clone, Debug)]
+pub struct BuildEntropy {
+    /// The value of `PYTHONHASHSEED`.
+    pub hash_seed: u32,
+    /// The bytes that `wasi:random` returns, in order, for both the secure and
+    /// insecure sources.
+    pub random_bytes: Vec<u8>,
+    /// The value of `wasi:random/insecure-seed`.
+    pub insecure_seed: u128,
+}
+
+impl BuildEntropy {
+    /// Derives the entropy from the linked component, the application name
+    /// and the files of the application's Python path entries, so that
+    /// applications built from the same prepared assets get different values.
+    pub fn for_inputs(
+        component: &[u8],
+        app_name: &str,
+        python_path: &[impl AsRef<Path>],
+    ) -> Result<Self> {
+        let digest = build_digest(component, app_name, python_path)?;
+        Ok(Self {
+            hash_seed: u32::from_le_bytes(digest[..4].try_into().unwrap()),
+            random_bytes: (0u32..1024)
+                .flat_map(|counter| {
+                    Sha256::new()
+                        .chain_update(digest)
+                        .chain_update(counter.to_le_bytes())
+                        .finalize()
+                })
+                .collect(),
+            insecure_seed: u128::from_le_bytes(digest[..16].try_into().unwrap()),
+        })
+    }
+}
+
+/// Everything an initializer needs to pre-initialize a linked component.
+///
+/// An initializer instantiates the instrumented component with WASIp2, these
+/// environment variables and preopens, the entropy in `entropy`, wall and
+/// monotonic clocks that start at zero and advance one microsecond per read,
+/// an empty stdin, and a trapping stub for each entry of `stubs`.  It then
+/// calls `componentize-py:init/exports#init` with `app_name`, `symbols` and
+/// `stub_wasi`.
+#[derive(Clone, Debug)]
+pub struct InitPlan {
+    pub app_name: String,
+    pub symbols: Symbols,
+    pub stubs: Vec<ImportStub>,
+    pub stub_wasi: bool,
+    pub env: Vec<(String, String)>,
+    pub preopens: Vec<Preopen>,
+    pub entropy: BuildEntropy,
+}
+
+/// The WIT world of the runtime's initialization export.
+const INIT_WIT: &str = include_str!("../wit/init.wit");
+
+impl InitPlan {
+    fn new(
+        app_name: &str,
+        symbols: Symbols,
+        stubs: Vec<ImportStub>,
+        stub_wasi: bool,
+        preopens: Vec<Preopen>,
+        python_path: &[String],
+        entropy: BuildEntropy,
+    ) -> Self {
+        let python_path = iter::once("/python")
+            .chain(iter::once("/world"))
+            .chain(python_path.iter().map(String::as_str))
+            .chain(iter::once("/bundled"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let env = [
+            ("PYTHONHASHSEED", entropy.hash_seed.to_string()),
+            // Writing bytecode would change the source directories during the
+            // build and record the time of the write.
+            ("PYTHONDONTWRITEBYTECODE", "1".to_owned()),
+            ("PYTHONUNBUFFERED", "1".to_owned()),
+            ("PYTHONHOME", "/python".to_owned()),
+            ("PYTHONPATH", python_path),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+
+        Self {
+            app_name: app_name.to_owned(),
+            symbols,
+            stubs,
+            stub_wasi,
+            env,
+            preopens,
+            entropy,
+        }
+    }
+}
+
+/// Adds a trapping stub to `linker` for each import in `stubs`.
+///
+/// An initializer adds WASIp2 first, then these stubs.
+pub fn add_trapping_stubs<T: 'static>(linker: &mut Linker<T>, stubs: &[ImportStub]) -> Result<()> {
+    let mut by_interface = IndexMap::<_, Vec<_>>::new();
+    for stub in stubs {
+        by_interface
+            .entry(stub.interface.as_deref())
+            .or_default()
+            .push(stub);
+    }
+
+    for (interface_name, stubs) in by_interface {
+        let mut instance = if let Some(interface_name) = interface_name {
+            match linker.instance(interface_name) {
+                Ok(instance) => instance,
+                Err(_) => continue,
+            }
+        } else {
+            linker.root()
+        };
+        let qualified = |name: &str| match interface_name {
+            Some(interface_name) => format!("{interface_name}#{name}"),
+            None => name.to_owned(),
+        };
+        for stub in stubs {
+            let message = format!("called trapping stub: {}", qualified(&stub.name));
+            match stub.kind {
+                ImportStubKind::Function { is_async: true } => {
+                    instance.func_new_concurrent(&stub.name, move |_, _, _, _| {
+                        let message = message.clone();
+                        Box::pin(async move { Err(wasmtime::format_err!("{message}")) })
+                    })
+                }
+                ImportStubKind::Function { is_async: false } => instance
+                    .func_new(&stub.name, move |_, _, _, _| {
+                        Err(wasmtime::format_err!("{message}"))
+                    }),
+                ImportStubKind::Resource => instance
+                    .resource(&stub.name, ResourceType::host::<()>(), move |_, _| {
+                        Err(wasmtime::format_err!("{message}"))
+                    })
+                    .map(drop),
+            }?;
+        }
+    }
+
+    Ok(())
+}
+
+/// The engine that `componentize` and `assemble` use.
+pub fn default_engine() -> Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_map(true);
+    Ok(Engine::new(&config)?)
+}
+
+/// Pre-initializes `component` according to `plan`, with this crate's WASI
+/// implementation on `engine`.
+#[cfg(feature = "embedded-runtime")]
+async fn initialize(
+    component: &[u8],
+    stubbed_component: component_init_transform::Stage2Map<'_>,
+    plan: &InitPlan,
+    engine: &Engine,
+    add_to_linker: AddToLinker<'_>,
+) -> Result<Vec<u8>> {
+    let stdout = MemoryOutputPipe::new(10000);
+    let stderr = MemoryOutputPipe::new(10000);
+
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.secure_random(Deterministic::new(plan.entropy.random_bytes.clone()))
+        .insecure_random(Deterministic::new(plan.entropy.random_bytes.clone()))
+        .insecure_random_seed(plan.entropy.insecure_seed)
+        .wall_clock(BuildClock::default())
+        .monotonic_clock(BuildClock::default())
+        .stdin(MemoryInputPipe::new(Bytes::new()))
+        .stdout(stdout.clone())
+        .stderr(stderr.clone());
+    for (key, value) in &plan.env {
+        wasi.env(key, value);
+    }
+    for preopen in &plan.preopens {
+        wasi.preopened_dir(&preopen.host, &preopen.guest, FsPerms::ReadWrite)?;
+    }
+    let wasi = wasi.build();
+
+    let mut linker = Linker::new(engine);
+    if let Some(add_to_linker) = add_to_linker {
+        add_to_linker(&mut linker)?;
+    } else {
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        add_trapping_stubs(&mut linker, &plan.stubs)?;
+    }
+
+    let store = Store::new(
+        engine,
+        Ctx {
+            wasi,
+            table: ResourceTable::new(),
+        },
+    );
+
+    initialize_component(component, stubbed_component, plan, store, linker)
         .await
         .with_context(move || {
             format!(
@@ -1103,18 +1402,47 @@ impl ComponentGenerator<'_> {
                 String::from_utf8_lossy(&stdout.try_into_inner().unwrap()),
                 String::from_utf8_lossy(&stderr.try_into_inner().unwrap())
             )
-        })?;
-
-        // Checks if the output directory exists, and creates it if it doesn't.
-        if let Some(parent) = self.output_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(self.output_path, component)?;
-
-        Ok(())
-    }
+        })
 }
 
+/// Pre-initializes `component` according to `plan` with the caller's store
+/// and linker, and returns the initialized component.
+///
+/// The store's engine must enable the component model and its async support.
+/// The store must provide the WASI context that `plan` describes, and the
+/// linker must provide WASIp2 and the plan's stubs; see [`InitPlan`] and
+/// [`add_trapping_stubs`].
+pub async fn initialize_component<T: Send + 'static>(
+    component: &[u8],
+    stubbed_component: component_init_transform::Stage2Map<'_>,
+    plan: &InitPlan,
+    mut store: Store<T>,
+    linker: Linker<T>,
+) -> Result<Vec<u8>> {
+    let app_name = plan.app_name.clone();
+    let symbols = plan.symbols.clone();
+    let stub_wasi = plan.stub_wasi;
+    component_init_transform::initialize_staged(component, stubbed_component, move |instrumented| {
+        async move {
+            let engine = store.engine().clone();
+            let component = &Component::new(&engine, instrumented)?;
+            let pre = InitPre::new(linker.instantiate_pre(component)?)?;
+            let instance = pre.instance_pre.instantiate_async(&mut store).await?;
+            let guest = pre.indices.interface0.load(&mut store, &instance)?;
+
+            guest
+                .call_init(&mut store, &app_name, &symbols, stub_wasi)
+                .await?
+                .map_err(|e| anyhow!("{e}"))?;
+
+            Ok(Box::new(MyInvoker { store, instance }) as Box<dyn Invoker>)
+        }
+        .boxed()
+    })
+    .await
+}
+
+#[cfg(feature = "embedded-runtime")]
 fn parse_features(features: &[&str]) -> IndexSet<String> {
     features
         .iter()
@@ -1128,6 +1456,7 @@ fn parse_features(features: &[&str]) -> IndexSet<String> {
         .collect()
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn available_worlds(resolve: &Resolve) -> Vec<String> {
     resolve
         .worlds
@@ -1151,6 +1480,7 @@ fn available_worlds(resolve: &Resolve) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn select_world(
     resolve: &Resolve,
     world: Option<&str>,
@@ -1178,6 +1508,7 @@ fn select_world(
         })
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn union_world(
     resolve: &mut Resolve,
     name: &str,
@@ -1217,6 +1548,7 @@ fn union_world(
     Ok(union_world)
 }
 
+#[cfg(feature = "embedded-runtime")]
 fn intersect_world(resolve: &mut Resolve, intersector: WorldId, world: WorldId) {
     let (imports_to_remove, exports_to_remove) = {
         let intersector = &resolve.worlds[intersector];
@@ -1258,152 +1590,7 @@ fn intersect_world(resolve: &mut Resolve, intersector: WorldId, world: WorldId) 
     world.exports.retain(|k, _| !exports_to_remove.contains(k));
 }
 
-fn add_wasi_and_stubs(
-    resolve: &Resolve,
-    worlds: &IndexSet<WorldId>,
-    linker: &mut Linker<Ctx>,
-) -> Result<()> {
-    wasmtime_wasi::p2::add_to_linker_async(linker)?;
-
-    enum Stub<'a> {
-        Function(&'a String, &'a FunctionKind),
-        Resource(&'a String),
-    }
-
-    let mut stubs = HashMap::<_, Vec<_>>::new();
-    for &world in worlds {
-        for (key, item) in &resolve.worlds[world].imports {
-            match item {
-                WorldItem::Interface { id, .. } => {
-                    let interface_name = match key {
-                        WorldKey::Name(name) => name.clone(),
-                        WorldKey::Interface(interface) => resolve.id_of(*interface).unwrap(),
-                    };
-
-                    let interface = &resolve.interfaces[*id];
-                    for (function_name, function) in &interface.functions {
-                        stubs
-                            .entry(Some(interface_name.clone()))
-                            .or_default()
-                            .push(Stub::Function(function_name, &function.kind));
-                    }
-
-                    for (type_name, id) in interface.types.iter() {
-                        if let TypeDefKind::Resource = &resolve.types[*id].kind {
-                            stubs
-                                .entry(Some(interface_name.clone()))
-                                .or_default()
-                                .push(Stub::Resource(type_name));
-                        }
-                    }
-                }
-                WorldItem::Function(function) => {
-                    stubs
-                        .entry(None)
-                        .or_default()
-                        .push(Stub::Function(&function.name, &function.kind));
-                }
-                WorldItem::Type { id, .. } => {
-                    let ty = &resolve.types[*id];
-                    if let TypeDefKind::Resource = &ty.kind {
-                        stubs
-                            .entry(None)
-                            .or_default()
-                            .push(Stub::Resource(ty.name.as_ref().unwrap()));
-                    }
-                }
-            }
-        }
-    }
-
-    for (interface_name, stubs) in stubs {
-        if let Some(interface_name) = interface_name {
-            // Note that we do _not_ stub interfaces which appear to be part of
-            // WASIp2 since those should be provided by the
-            // `wasmtime_wasi::add_to_linker_async` call above, and adding stubs
-            // to those same interfaces would just cause trouble.
-            if !is_wasip2_cli(&interface_name)
-                && let Ok(mut instance) = linker.instance(&interface_name)
-            {
-                for stub in stubs {
-                    let interface_name = interface_name.clone();
-                    match stub {
-                        Stub::Function(name, kind) => {
-                            if kind.is_async() {
-                                instance.func_new_concurrent(name, {
-                                    let name = name.clone();
-                                    move |_, _, _, _| {
-                                        let interface_name = interface_name.clone();
-                                        let name = name.clone();
-                                        Box::pin(async move {
-                                            Err(wasmtime::format_err!(
-                                                "called trapping stub: {interface_name}#{name}"
-                                            ))
-                                        })
-                                    }
-                                })
-                            } else {
-                                instance.func_new(name, {
-                                    let name = name.clone();
-                                    move |_, _, _, _| {
-                                        Err(wasmtime::format_err!(
-                                            "called trapping stub: {interface_name}#{name}"
-                                        ))
-                                    }
-                                })
-                            }
-                        }
-                        Stub::Resource(name) => instance
-                            .resource(name, ResourceType::host::<()>(), {
-                                let name = name.clone();
-                                move |_, _| {
-                                    Err(wasmtime::format_err!(
-                                        "called trapping stub: {interface_name}#{name}"
-                                    ))
-                                }
-                            })
-                            .map(drop),
-                    }?;
-                }
-            }
-        } else {
-            let mut instance = linker.root();
-            for stub in stubs {
-                match stub {
-                    Stub::Function(name, kind) => {
-                        if kind.is_async() {
-                            instance.func_new_concurrent(name, {
-                                let name = name.clone();
-                                move |_, _, _, _| {
-                                    let name = name.clone();
-                                    Box::pin(async move {
-                                        Err(wasmtime::format_err!("called trapping stub: {name}"))
-                                    })
-                                }
-                            })
-                        } else {
-                            instance.func_new(name, {
-                                let name = name.clone();
-                                move |_, _, _, _| {
-                                    Err(wasmtime::format_err!("called trapping stub: {name}"))
-                                }
-                            })
-                        }
-                    }
-                    Stub::Resource(name) => instance
-                        .resource(name, ResourceType::host::<()>(), {
-                            let name = name.clone();
-                            move |_, _| Err(wasmtime::format_err!("called trapping stub: {name}"))
-                        })
-                        .map(drop),
-                }?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
+#[cfg(feature = "embedded-runtime")]
 fn is_wasip2_cli(interface_name: &str) -> bool {
     (interface_name.starts_with("wasi:cli/")
         || interface_name.starts_with("wasi:clocks/")
@@ -1418,7 +1605,11 @@ fn is_wasip2_cli(interface_name: &str) -> bool {
 /// relative path and content of every file in each Python path entry, in
 /// sorted order. A symbolic link counts as its target path, not as the content
 /// it points to.
-fn build_digest(component: &[u8], app_name: &str, python_path: &[&str]) -> Result<[u8; 32]> {
+fn build_digest(
+    component: &[u8],
+    app_name: &str,
+    python_path: &[impl AsRef<Path>],
+) -> Result<[u8; 32]> {
     fn update_tree(hasher: &mut Sha256, root: &Path, path: &Path) -> Result<()> {
         let relative = path
             .strip_prefix(root)?
@@ -1455,7 +1646,7 @@ fn build_digest(component: &[u8], app_name: &str, python_path: &[&str]) -> Resul
     hasher.update([0]);
     for (index, entry) in python_path.iter().enumerate() {
         hasher.update((index as u64).to_le_bytes());
-        let root = fs::canonicalize(entry)?;
+        let root = fs::canonicalize(entry.as_ref())?;
         update_tree(&mut hasher, &root, &root)?;
     }
     Ok(hasher.finalize().into())
